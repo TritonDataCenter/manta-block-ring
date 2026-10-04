@@ -267,7 +267,7 @@ mod bulk {
         #[cfg(all(target_arch = "x86_64", not(miri)))]
         // SAFETY: the caller's guarantee.
         unsafe {
-            movsb(src, out.as_mut_ptr(), out.len());
+            copy(src, out.as_mut_ptr(), out.len());
         }
         #[cfg(not(all(target_arch = "x86_64", not(miri))))]
         for (i, b) in out.iter_mut().enumerate() {
@@ -285,7 +285,7 @@ mod bulk {
         #[cfg(all(target_arch = "x86_64", not(miri)))]
         // SAFETY: the caller's guarantee.
         unsafe {
-            movsb(data.as_ptr(), dst, data.len());
+            copy(data.as_ptr(), dst, data.len());
         }
         #[cfg(not(all(target_arch = "x86_64", not(miri))))]
         for (i, &b) in data.iter().enumerate() {
@@ -294,19 +294,53 @@ mod bulk {
         }
     }
 
+    // Not rep movsb for the bulk: the L2 streamer does not prefetch
+    // ownership for its stores, so each line the peer just read takes a
+    // demand RFO miss and the copy runs at cross-core latency.
     #[cfg(all(target_arch = "x86_64", not(miri)))]
-    unsafe fn movsb(src: *const u8, dst: *mut u8, len: usize) {
-        // Rust's inline-asm rules guarantee the direction flag is clear on
-        // entry.
-        // SAFETY: the caller's guarantee.
-        unsafe {
-            std::arch::asm!(
-                "rep movsb",
-                inout("rcx") len => _,
-                inout("rsi") src => _,
-                inout("rdi") dst => _,
-                options(nostack, preserves_flags),
-            );
+    unsafe fn copy(src: *const u8, dst: *mut u8, len: usize) {
+        let body = len & !63;
+        if body > 0 {
+            // SAFETY: the caller's guarantee.
+            unsafe {
+                std::arch::asm!(
+                    "2:",
+                    "movdqu {a}, xmmword ptr [{s} + {i}]",
+                    "movdqu {b}, xmmword ptr [{s} + {i} + 16]",
+                    "movdqu {c}, xmmword ptr [{s} + {i} + 32]",
+                    "movdqu {e}, xmmword ptr [{s} + {i} + 48]",
+                    "movdqu xmmword ptr [{d} + {i}], {a}",
+                    "movdqu xmmword ptr [{d} + {i} + 16], {b}",
+                    "movdqu xmmword ptr [{d} + {i} + 32], {c}",
+                    "movdqu xmmword ptr [{d} + {i} + 48], {e}",
+                    "add {i}, 64",
+                    "cmp {i}, {n}",
+                    "jb 2b",
+                    s = in(reg) src,
+                    d = in(reg) dst,
+                    n = in(reg) body,
+                    i = inout(reg) 0usize => _,
+                    a = out(xmm_reg) _,
+                    b = out(xmm_reg) _,
+                    c = out(xmm_reg) _,
+                    e = out(xmm_reg) _,
+                    options(nostack),
+                );
+            }
+        }
+        if len > body {
+            // Rust's inline-asm rules guarantee the direction flag is clear
+            // on entry.
+            // SAFETY: the caller's guarantee.
+            unsafe {
+                std::arch::asm!(
+                    "rep movsb",
+                    inout("rcx") len - body => _,
+                    inout("rsi") src.add(body) => _,
+                    inout("rdi") dst.add(body) => _,
+                    options(nostack, preserves_flags),
+                );
+            }
         }
     }
 }
@@ -573,7 +607,9 @@ mod tests {
             (vec![0, 1, 7, 8, 15, 16, 17, 31, 33], 0..3)
         } else {
             (
-                (0..=80).chain([127, 255, 504, 1021, 1023, 1024]).collect(),
+                (0..=80)
+                    .chain([127, 128, 129, 191, 192, 193, 255, 504, 1021, 1023, 1024])
+                    .collect(),
                 0..16,
             )
         };
