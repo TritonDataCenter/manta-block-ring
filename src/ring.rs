@@ -248,19 +248,15 @@ impl Region {
     }
 }
 
-/// A copy that a concurrent writer cannot make undefined.
+/// Copies of the buffer area that a racing peer write cannot make undefined.
 ///
-/// A plain or volatile copy that races with a write is a data race, which is
-/// undefined behavior even if the bytes are never trusted. The Reference only
-/// says inline asm may access what FFI code could. Our working assumption,
-/// from current Rust opsem thinking, is that asm must behave like some Rust
-/// code, and our stand-in is a relaxed `AtomicU8` load and store per byte. A
-/// race then only tears the data, which callers already treat as untrusted.
-/// The asm is not `nomem` or `readonly`, so the `Acquire` and `Release` index
-/// operations order it. A stable atomic memcpy (RFC 3301) would replace this.
-#[cfg(all(not(miri), any(target_arch = "x86_64", target_arch = "aarch64")))]
+/// A plain copy that races a write is a data race even if the bytes are never
+/// trusted. We assume the asm copy behaves like a relaxed `AtomicU8` copy per
+/// byte, which is what the fallback does, so a race only tears the data. The
+/// asm is not `nomem`, so the index `Acquire` and `Release` order it.
 mod bulk {
-    use std::arch::asm;
+    #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     /// # Safety
     ///
@@ -268,8 +264,16 @@ mod bulk {
     /// Another process may write it at any time; in this process other
     /// threads touch it only through `load` and `store`.
     pub(super) unsafe fn load(src: *const u8, out: &mut [u8]) {
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
         // SAFETY: the caller's guarantee.
-        unsafe { copy(src, out.as_mut_ptr(), out.len()) }
+        unsafe {
+            movsb(src, out.as_mut_ptr(), out.len());
+        }
+        #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+        for (i, b) in out.iter_mut().enumerate() {
+            // SAFETY: the caller's guarantee.
+            *b = unsafe { AtomicU8::from_ptr(src.add(i).cast_mut()) }.load(Ordering::Relaxed);
+        }
     }
 
     /// # Safety
@@ -278,86 +282,31 @@ mod bulk {
     /// Another process may write it at any time; in this process other
     /// threads touch it only through `load` and `store`.
     pub(super) unsafe fn store(data: &[u8], dst: *mut u8) {
-        // SAFETY: the caller's guarantee.
-        unsafe { copy(data.as_ptr(), dst, data.len()) }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    unsafe fn copy(src: *const u8, dst: *mut u8, len: usize) {
-        // ERMS and FSRM make `rep movsb` as fast as memcpy on the CPUs we run
-        // on. Rust's inline-asm rules guarantee the direction flag is clear
-        // on entry.
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
         // SAFETY: the caller's guarantee.
         unsafe {
-            asm!(
+            movsb(data.as_ptr(), dst, data.len());
+        }
+        #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+        for (i, &b) in data.iter().enumerate() {
+            // SAFETY: the caller's guarantee.
+            unsafe { AtomicU8::from_ptr(dst.add(i)) }.store(b, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    unsafe fn movsb(src: *const u8, dst: *mut u8, len: usize) {
+        // Rust's inline-asm rules guarantee the direction flag is clear on
+        // entry.
+        // SAFETY: the caller's guarantee.
+        unsafe {
+            std::arch::asm!(
                 "rep movsb",
                 inout("rcx") len => _,
                 inout("rsi") src => _,
                 inout("rdi") dst => _,
                 options(nostack, preserves_flags),
             );
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    unsafe fn copy(src: *const u8, dst: *mut u8, len: usize) {
-        // SAFETY: the caller's guarantee. The pair loop runs `len / 16` times
-        // and one bit of `len` picks each tail step, so no length overruns.
-        unsafe {
-            asm!(
-                "lsr {c}, {n}, #4",
-                "cbz {c}, 2f",
-                "1:",
-                "ldp {a}, {b}, [{src}], #16",
-                "stp {a}, {b}, [{dst}], #16",
-                "sub {c}, {c}, #1",
-                "cbnz {c}, 1b",
-                "2:",
-                "tbz {n}, #3, 3f",
-                "ldr {a}, [{src}], #8",
-                "str {a}, [{dst}], #8",
-                "3:",
-                "tbz {n}, #2, 4f",
-                "ldr {a:w}, [{src}], #4",
-                "str {a:w}, [{dst}], #4",
-                "4:",
-                "tbz {n}, #1, 5f",
-                "ldrh {a:w}, [{src}], #2",
-                "strh {a:w}, [{dst}], #2",
-                "5:",
-                "tbz {n}, #0, 6f",
-                "ldrb {a:w}, [{src}]",
-                "strb {a:w}, [{dst}]",
-                "6:",
-                n = in(reg) len,
-                c = out(reg) _,
-                src = inout(reg) src => _,
-                dst = inout(reg) dst => _,
-                a = out(reg) _,
-                b = out(reg) _,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-}
-
-// Miri cannot run asm, and other targets have no asm copy yet. This is the
-// stand-in the asm is held to, so Miri checks the model.
-#[cfg(not(all(not(miri), any(target_arch = "x86_64", target_arch = "aarch64"))))]
-mod bulk {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    pub(super) unsafe fn load(src: *const u8, out: &mut [u8]) {
-        for (i, b) in out.iter_mut().enumerate() {
-            // SAFETY: the caller's guarantee.
-            *b = unsafe { AtomicU8::from_ptr(src.add(i).cast_mut()) }.load(Ordering::Relaxed);
-        }
-    }
-
-    pub(super) unsafe fn store(data: &[u8], dst: *mut u8) {
-        for (i, &b) in data.iter().enumerate() {
-            // SAFETY: the caller's guarantee.
-            unsafe { AtomicU8::from_ptr(dst.add(i)) }.store(b, Ordering::Relaxed);
         }
     }
 }
