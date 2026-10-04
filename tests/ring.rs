@@ -17,34 +17,32 @@ use manta_block_ring::{
 
 const GEN: u64 = 0x5eed;
 
-/// A zeroed, page-aligned region that is never freed, so it outlives every
-/// handle. Returns the region and the raw base for tests that play a
-/// hostile peer.
+/// Never freed, so it outlives every handle. The raw base is for tests that
+/// play a hostile peer.
 fn region(g: Geometry) -> (Arc<Region>, usize) {
     let layout = Layout::from_size_align(g.region_len(), PAGE).unwrap();
     // SAFETY: the layout has a non-zero size.
     let base = unsafe { alloc_zeroed(layout) };
     assert!(!base.is_null());
-    // SAFETY: `base` is a fresh allocation of `region_len` bytes that is
-    // never freed; tests touch it only through the Region or with atomics.
+    // SAFETY: a fresh, never-freed allocation of `region_len` bytes, only
+    // touched through the Region or with atomics.
     let r = unsafe { Region::from_raw_parts(base, g.region_len(), g) }.unwrap();
     (Arc::new(r), base as usize)
 }
 
-/// Writes a control field as the other process would. Control fields are
-/// 32-bit atomics on both sides.
+/// Writes a control field as the other process would.
 fn poke(base: usize, off: usize, v: u32) {
-    // SAFETY: `off` is a 4-byte aligned control field inside the test
-    // region, which is only accessed with 32-bit atomics there.
+    // SAFETY: `off` is an aligned control field, only accessed as a 32-bit
+    // atomic.
     unsafe { std::sync::atomic::AtomicU32::from_ptr((base + off) as *mut u32) }
         .store(v, Ordering::SeqCst);
 }
 
-/// Writes 8 bytes of an entry or buffer area. The ring reads those as
-/// 64-bit atomics, so a test must not store them with another size.
+/// The ring reads entries and buffers as 64-bit atomics, so a test must
+/// not store them with another size.
 fn poke64(base: usize, off: usize, v: u64) {
-    // SAFETY: `off` is 8-byte aligned inside the test region, and this
-    // range is only accessed with 64-bit atomics.
+    // SAFETY: `off` is 8-byte aligned in the region and only accessed as a
+    // 64-bit atomic.
     unsafe { std::sync::atomic::AtomicU64::from_ptr((base + off) as *mut u64) }
         .store(v, Ordering::SeqCst);
 }
@@ -239,7 +237,6 @@ fn two_threads_move_every_request_and_completion() {
     let mut next = 0u64;
     let mut completed = 0u64;
     while completed < N {
-        // Submit while there is a free tag.
         let mut sent = false;
         while next < N {
             let Some(tag) = out.free_tag() else { break };
@@ -295,8 +292,7 @@ fn a_peer_writing_garbage_never_panics_the_engine() {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            // Anywhere in the control page and the rings, with the access
-            // size the ring uses there.
+            // Use the access size the ring uses at that offset.
             let off = PAGE + (x as usize) % (3 * PAGE);
             if off < 2 * PAGE {
                 poke(base, off & !3, (x >> 32) as u32);
@@ -312,8 +308,7 @@ fn a_peer_writing_garbage_never_panics_the_engine() {
         volume_blocks: 1 << 20,
         max_blocks: 4,
     };
-    // The scheduler can run the whole loop before the hostile thread starts,
-    // so wait for its first writes, and go on until it has had an effect.
+    // The loop can finish before the hostile thread starts, so wait for it.
     while writes.load(Ordering::Relaxed) < 1_000 {
         thread::yield_now();
     }
@@ -344,15 +339,12 @@ fn a_peer_writing_garbage_never_panics_the_engine() {
     }
     stop.store(true, Ordering::Relaxed);
     hostile.join().unwrap();
-    // Garbage is refused or seen as a broken peer; it never panics.
     assert!(rejected + broken > 0, "the hostile writer had no effect");
     let _ = ok;
 }
 
-/// The interleaving a lost wake-up needs, step by step: the consumer finds
-/// the ring empty, the producer publishes before the consumer sets its idle
-/// flag (so it sends no wake-up), then the consumer gets ready to sleep. It
-/// must see the new entry instead of sleeping.
+/// The producer publishes before the consumer sets its idle flag, so it
+/// sends no wake-up. The consumer must see the entry instead of sleeping.
 #[test]
 fn the_consumer_rechecks_before_it_sleeps() {
     let g = Geometry::new(1, 4, 1).unwrap();
@@ -368,8 +360,7 @@ fn the_consumer_rechecks_before_it_sleeps() {
     );
     assert!(eng.pop().unwrap().is_some());
 
-    // The other order: the consumer is idle first, so the producer must
-    // ask for a wake-up.
+    // Idle first: now the producer must ask for a wake-up.
     assert_eq!(eng.pop().unwrap(), None);
     assert!(eng.prepare_wait().unwrap());
     assert!(sq.try_push(&sqe(1, 1, 0, 0).encode()).unwrap());

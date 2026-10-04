@@ -1,7 +1,5 @@
-//! Frozen bytes of region layout version 1 and control protocol version 1.
-//! rust-bhyve and the engine must agree on these forever. A change that
-//! moves a field fails here; add a version or a feature bit instead
-//! (spec 37 §9).
+//! Frozen bytes of layout version 1 and protocol version 1. If one of
+//! these fails, add a version or a feature bit; do not change the bytes.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -22,8 +20,7 @@ fn header_bytes() {
     assert_eq!(hex(&h.encode()), HEADER);
 }
 
-/// A ring smaller than a page still takes a whole page, so the completion
-/// ring and the buffer area start on a page.
+/// A ring smaller than a page still takes a whole page.
 #[test]
 fn small_ring_header_bytes() {
     let h = Header {

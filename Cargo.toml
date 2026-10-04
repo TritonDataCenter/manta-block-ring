@@ -10,15 +10,13 @@ description = "Shared-memory ring between rust-bhyve and the MantaBlock engine"
 keywords = ["nvme", "ring", "shared-memory", "bhyve"]
 categories = ["os", "concurrency"]
 
-# rust-bhyve and the engine both depend on this crate, so it has no
-# dependencies.
+# Keep empty: rust-bhyve and the engine both build this crate.
 [dependencies]
 
 [dev-dependencies]
 proptest = "1"
 
-# Only `ring.rs`, which reads and writes the shared mapping, allows unsafe
-# code.
+# Only `ring.rs` allows unsafe code.
 [lints.rust]
 missing_docs = "deny"
 unsafe_code = "deny"

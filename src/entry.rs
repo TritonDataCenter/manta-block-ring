@@ -1,12 +1,9 @@
-//! Submission and completion entries (spec 37 §3) and the request id
-//! (§5). Entries are plain values here; `ring.rs` moves their bytes in and
-//! out of shared memory.
+//! Submission and completion entries and the request id, as plain values.
 
 use crate::error::EntryError;
 use crate::layout::{CQE_BYTES, SQE_BYTES};
 
-/// A guest request id: the attachment generation, the queue and a sequence
-/// that only goes up. Spec 36 stores it in the log as a `u128`.
+/// A guest request id. The log stores it as a `u128`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OpId {
     /// New for each rust-bhyve process that attaches the volume.
@@ -66,8 +63,7 @@ impl Op {
     }
 }
 
-/// A submission entry, field by field. Values are not checked here; the
-/// engine checks them with [`crate::check::QueueState::check`].
+/// A submission entry, unchecked; see [`crate::check::QueueState::check`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sqe {
     /// See [`OpId`].
@@ -130,8 +126,8 @@ impl Sqe {
     }
 }
 
-/// Completion status (spec 37 §3). 4 is reserved: a request that breaks
-/// the protocol gets no completion.
+/// Completion status. 4 is reserved: a request that breaks the protocol
+/// gets no completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     /// Done; a write is durable on the ack quorum.

@@ -1,9 +1,4 @@
-//! The checks each side runs on what the other side sends (spec 37 §4).
-//!
-//! [`QueueState`] is the engine's view of one queue. It never trusts a
-//! value from shared memory: it checks every request against what it agreed
-//! at attach and what it has already taken. [`Outstanding`] is rust-bhyve's
-//! table of requests in flight, which every completion must match.
+//! The checks each side runs on what the other side sends.
 
 use crate::entry::{Cqe, Op, OpId, Sqe};
 use crate::error::{BadCompletion, Reject};
@@ -11,7 +6,7 @@ use crate::error::{BadCompletion, Reject};
 /// What the engine agreed for one attachment, in private memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
-    /// The attachment's generation, from FoundationDB.
+    /// Issued from FoundationDB at attach.
     pub generation: u64,
     /// Entries per ring.
     pub depth: u32,
@@ -30,7 +25,7 @@ pub struct Request {
     pub tag: u16,
     /// Read, write or flush.
     pub op: Op,
-    /// The request id.
+    /// Decoded from the entry.
     pub op_id: OpId,
     /// First 4 KiB block (0 for flush).
     pub lba: u64,
@@ -52,8 +47,8 @@ pub struct QueueState {
 }
 
 impl QueueState {
-    /// A queue with nothing taken yet. `floor` is the highest watermark
-    /// already known for this generation and queue (0 if none).
+    /// `floor` is the highest watermark already known for this generation
+    /// and queue, or 0.
     pub fn new(queue: u16, limits: Limits, floor: u64) -> Self {
         Self {
             queue,
@@ -65,8 +60,7 @@ impl QueueState {
         }
     }
 
-    /// True while the engine may take another request: fewer than `depth`
-    /// are in flight, so their completions always fit in the ring.
+    /// Fewer than `depth` in flight, so every completion fits in the CQ.
     pub fn can_take(&self) -> bool {
         self.in_flight < self.limits.depth
     }
@@ -76,14 +70,13 @@ impl QueueState {
         self.in_flight
     }
 
-    /// The highest watermark seen: no request below it is taken.
+    /// No request below this sequence is taken.
     pub fn floor(&self) -> u64 {
         self.floor
     }
 
-    /// Checks a request copied out of the ring. On success the request is
-    /// in flight until [`QueueState::complete`]. Call only when
-    /// [`QueueState::can_take`] is true.
+    /// On success the request is in flight until [`QueueState::complete`].
+    /// Call only when [`QueueState::can_take`] is true.
     pub fn check(&mut self, e: &Sqe) -> Result<Request, Reject> {
         let op = Op::from_u8(e.op).ok_or(Reject::Op(e.op))?;
         if e.flags != 0 || e.reserved != [0; 12] {
@@ -153,8 +146,8 @@ impl QueueState {
         })
     }
 
-    /// Marks a taken request complete once its completion is in the ring.
-    /// Returns false if nothing with that tag was in flight.
+    /// Call once the completion is in the ring. Returns false if nothing
+    /// with that tag was in flight.
     pub fn complete(&mut self, tag: u16) -> bool {
         if u32::from(tag) >= self.limits.depth || !self.tag_in_flight(tag) {
             return false;
@@ -186,7 +179,7 @@ pub struct Outstanding {
 }
 
 impl Outstanding {
-    /// An empty table for a ring of `depth` entries.
+    /// An empty table with `depth` tags.
     pub fn new(depth: u32) -> Self {
         Self {
             slots: vec![None; depth as usize],
@@ -201,8 +194,7 @@ impl Outstanding {
             .map(|t| t as u16)
     }
 
-    /// Records a request sent with `tag`. Returns false if the tag is out
-    /// of range or already in use.
+    /// Returns false if the tag is out of range or already in use.
     pub fn insert(&mut self, tag: u16, op_id: OpId) -> bool {
         match self.slots.get_mut(usize::from(tag)) {
             Some(slot @ None) => {
@@ -213,7 +205,7 @@ impl Outstanding {
         }
     }
 
-    /// Checks a completion against the table and frees its tag.
+    /// Frees the tag if the completion matches.
     pub fn complete(&mut self, c: &Cqe) -> Result<(), BadCompletion> {
         let slot = self
             .slots

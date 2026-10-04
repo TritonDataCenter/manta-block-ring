@@ -1,13 +1,11 @@
-//! Control messages on the Unix socket (spec 37 §6). This module only
-//! encodes and decodes; each side does its own non-blocking I/O and passes
-//! descriptors with `SCM_RIGHTS`.
+//! Control messages on the Unix socket. Encode and decode only; each side
+//! does its own I/O and passes descriptors with `SCM_RIGHTS`.
 //!
 //! ```text
 //! frame:   len u32 (whole frame) | kind u16 | version u16 | id u32 | body
 //! ```
 //!
-//! A frame is at most 4 KiB. Every body has an exact size; reserved bits
-//! must be zero.
+//! Every body has an exact size, and reserved bits must be zero.
 
 use crate::error::ControlError;
 

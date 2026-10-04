@@ -1,5 +1,4 @@
-//! Errors. Each says what the other side did wrong; none of them is a
-//! reason to guess.
+//! Errors. Each says what the other side did wrong.
 
 use std::fmt;
 
@@ -33,8 +32,8 @@ pub enum EntryError {
     Status(u16),
 }
 
-/// Why the engine refuses a request (spec 37 §4). A correct rust-bhyve never
-/// causes one; the engine sends Error and detaches.
+/// Why the engine refuses a request. A correct rust-bhyve never causes one;
+/// the engine sends Error and detaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reject {
     /// The op is not read, write or flush.
@@ -75,12 +74,11 @@ pub enum Reject {
     Flush,
 }
 
-/// The other side broke the ring protocol: an index moved in a way no
-/// correct peer moves it.
+/// An index moved in a way no correct peer moves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Broken;
 
-/// A completion that does not match an outstanding request (spec 37 §4).
+/// A completion that does not match an outstanding request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BadCompletion {
     /// The tag is not below the depth, or nothing is in flight with it.
@@ -91,7 +89,7 @@ pub enum BadCompletion {
     Entry(EntryError),
 }
 
-/// A control message breaks the protocol (spec 37 §6).
+/// A control message breaks the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlError {
     /// The length is below the frame header or above 4 KiB.

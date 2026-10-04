@@ -1,4 +1,4 @@
-//! Region geometry and the region header (spec 37 §3).
+//! Region geometry and the region header.
 //!
 //! ```text
 //! page 0                    region header
@@ -9,9 +9,8 @@
 //!   buf_pages × 4 KiB       buffer area
 //! ```
 //!
-//! Every block starts on a 4 KiB boundary. Both sides compute every offset
-//! from the geometry, with checked arithmetic, and never trust a size read
-//! from the region.
+//! Both sides compute every offset from the agreed geometry and never trust
+//! a size read from the region.
 
 use crate::error::LayoutError;
 
@@ -32,8 +31,8 @@ pub const MIN_DEPTH: u32 = 2;
 /// See [`MIN_DEPTH`].
 pub const MAX_DEPTH: u32 = 4096;
 
-/// Most buffer pages per queue the layout allows (4 GiB). The engine grants
-/// far fewer; this only keeps the arithmetic in range.
+/// 4 GiB per queue. The engine grants far fewer; this only bounds the
+/// arithmetic.
 pub const MAX_BUF_PAGES: u32 = 1 << 20;
 
 /// Bytes of one submission entry.
@@ -155,15 +154,15 @@ fn ring_bytes(depth: u32, entry: usize) -> Option<usize> {
         .map(|v| v & !(PAGE - 1))
 }
 
-/// The region header in page 0. It is informative: each side keeps the
-/// geometry it agreed to in private memory and only checks the header.
+/// The header in page 0. Informative only: each side keeps the agreed
+/// geometry in private memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     /// The agreed geometry.
     pub geometry: Geometry,
     /// Volume size in 4 KiB blocks.
     pub volume_blocks: u64,
-    /// The attachment's generation (spec 37 §5).
+    /// High 64 bits of every op id in this attachment.
     pub attach_generation: u64,
 }
 
@@ -187,8 +186,7 @@ impl Header {
         b
     }
 
-    /// Reads and checks a header. The sizes it states must be the ones the
-    /// geometry gives.
+    /// The stated sizes must match the ones the geometry gives.
     pub fn decode(b: &[u8; HEADER_BYTES]) -> Result<Self, LayoutError> {
         let u16_at = |at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
         let u32_at = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
@@ -240,7 +238,7 @@ mod tests {
             );
         }
         assert_eq!(g.region_len(), PAGE + 3 * g.queue_bytes());
-        // 1024 × 96 B = 24 pages of rings after the control page.
+        // 1024 x 96 B = 24 pages of rings.
         assert_eq!(g.queue_bytes(), (1 + 24 + 256) * PAGE);
     }
 

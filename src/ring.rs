@@ -1,13 +1,9 @@
-//! Moving entries and data through the shared region (spec 37 §4).
+//! Moving entries and data through the shared region.
 //!
-//! The other side can write any byte of the region at any time. So every
-//! access to shared memory here is an atomic load or store, never a plain
-//! reference or `copy_nonoverlapping`: that keeps this process sound even
-//! when the peer writes while we read. A torn entry is then only bad input,
-//! which the checks refuse.
-//!
-//! Each side keeps its own index in private memory and only writes it out;
-//! it never reads its own field back, because the peer can rewrite it.
+//! The peer can write any byte at any time, so every access here is an
+//! atomic, never a plain reference or `copy_nonoverlapping`. A torn entry is
+//! then only bad input for the checks. Each side keeps its own index in
+//! private memory and never reads its own field back.
 
 #![allow(unsafe_code)]
 
@@ -24,8 +20,7 @@ use crate::layout::{CQE_BYTES, Geometry, HEADER_BYTES, Header, PAGE, SQE_BYTES, 
 pub struct Region {
     base: NonNull<u8>,
     geometry: Geometry,
-    // Dropped with the Region, so whatever keeps the mapping alive lives as
-    // long as the last ring handle.
+    // Keeps the mapping alive as long as the last ring handle.
     _owner: Option<Box<dyn Any + Send + Sync>>,
 }
 
@@ -38,9 +33,8 @@ impl fmt::Debug for Region {
     }
 }
 
-// SAFETY: a Region only hands out atomic accesses to memory that, by the
-// contract of `from_raw_parts`, stays mapped while the Region lives. Atomics
-// are safe to use from any thread.
+// SAFETY: only atomic access, to memory that stays mapped while the Region
+// lives.
 unsafe impl Send for Region {}
 // SAFETY: as for Send; shared references only allow atomic access.
 unsafe impl Sync for Region {}
@@ -71,9 +65,8 @@ impl Region {
         })
     }
 
-    /// As [`Region::from_raw_parts`], and the region keeps `owner` until it
-    /// is dropped. Use this when `owner` unmaps the mapping on drop: the
-    /// mapping then outlives every handle made from the region.
+    /// As [`Region::from_raw_parts`], but holds `owner` (which may unmap on
+    /// drop) until the last handle is gone.
     ///
     /// # Safety
     ///
@@ -85,8 +78,8 @@ impl Region {
         geometry: Geometry,
         owner: impl Any + Send + Sync,
     ) -> Result<Self, LayoutError> {
-        // SAFETY: the caller's guarantee, extended by `owner`, which the
-        // Region holds until its last reference is gone.
+        // SAFETY: the caller's guarantee; the Region holds `owner` until it
+        // drops.
         let mut r = unsafe { Self::from_raw_parts(base, len, geometry) }?;
         r._owner = Some(Box::new(owner));
         Ok(r)
@@ -99,10 +92,9 @@ impl Region {
 
     fn u32_at(&self, off: usize) -> &AtomicU32 {
         debug_assert!(off.is_multiple_of(4) && off + 4 <= self.geometry.region_len());
-        // SAFETY: every caller computes `off` from the checked geometry, so it
-        // is inside the mapping and 4-byte aligned (the base is page-aligned).
-        // The mapping outlives `&self`, and this process only uses atomics on
-        // it.
+        // SAFETY: `off` comes from the checked geometry, so it is in the
+        // mapping and 4-byte aligned on a page-aligned base. The mapping
+        // outlives `&self` and is only used through atomics.
         unsafe { AtomicU32::from_ptr(self.base.as_ptr().add(off).cast()) }
     }
 
@@ -112,8 +104,7 @@ impl Region {
         unsafe { AtomicU64::from_ptr(self.base.as_ptr().add(off).cast()) }
     }
 
-    /// Copies bytes out of the region, 8 at a time. `out.len()` and `off`
-    /// are multiples of 8, and the range is inside the region.
+    /// `out.len()` and `off` must be multiples of 8 and inside the region.
     fn load(&self, off: usize, out: &mut [u8]) {
         for (i, chunk) in out.chunks_exact_mut(8).enumerate() {
             let v = self.u64_at(off + i * 8).load(Ordering::Relaxed);
@@ -121,7 +112,7 @@ impl Region {
         }
     }
 
-    /// Copies bytes into the region, 8 at a time. Same rules as `load`.
+    /// Same rules as `load`.
     fn store(&self, off: usize, data: &[u8]) {
         for (i, chunk) in data.chunks_exact(8).enumerate() {
             let mut v = [0u8; 8];
@@ -131,21 +122,19 @@ impl Region {
         }
     }
 
-    /// Writes the region header. The engine does this once, before it sends
-    /// the region, and never reads it back.
+    /// The engine calls this once, before it sends the region.
     pub fn write_header(&self, h: &Header) {
         self.store(0, &h.encode());
     }
 
-    /// Reads and checks the header. rust-bhyve does this once at attach.
+    /// rust-bhyve calls this once at attach.
     pub fn read_header(&self) -> Result<Header, LayoutError> {
         let mut b = [0u8; HEADER_BYTES];
         self.load(0, &mut b);
         Header::decode(&b)
     }
 
-    /// Copies `out.len()` bytes from queue `q`'s buffer area, starting at
-    /// page `page`. Returns false if the range is outside the area or the
+    /// Returns false if the range is outside queue `q`'s buffer area or the
     /// length is not a multiple of 8.
     pub fn read_buffer(&self, q: u16, page: u32, out: &mut [u8]) -> bool {
         match self.buffer_range(q, page, out.len()) {
@@ -157,8 +146,7 @@ impl Region {
         }
     }
 
-    /// Copies `data` into queue `q`'s buffer area at page `page`. Same rules
-    /// as [`Region::read_buffer`].
+    /// Same rules as [`Region::read_buffer`].
     pub fn write_buffer(&self, q: u16, page: u32, data: &[u8]) -> bool {
         match self.buffer_range(q, page, data.len()) {
             Some(off) => {
@@ -307,10 +295,11 @@ impl<const N: usize> Producer<N> {
     }
 
     /// Makes every pushed entry visible. Returns true if the consumer is
-    /// waiting and needs a wake-up (spec 37 §4, step 4).
+    /// idle and needs a wake-up.
     pub fn publish(&mut self) -> bool {
         let r = &self.ends.region;
         r.u32_at(self.ends.own).store(self.tail, Ordering::Release);
+        // Pairs with the fence in `prepare_wait` so a wake-up is never lost.
         fence(Ordering::SeqCst);
         r.u32_at(self.ends.idle).load(Ordering::Relaxed) == 1
     }
@@ -360,16 +349,14 @@ impl<const N: usize> Consumer<N> {
         Ok(Some(e))
     }
 
-    /// The producer's tail as this consumer last loaded it. After a
-    /// [`Consumer::pop`] that returned `None`, every entry up to it is
-    /// taken.
+    /// The tail as last loaded. After a [`Consumer::pop`] that returned
+    /// `None`, every entry up to it is taken.
     pub fn seen_tail(&self) -> u32 {
         self.tail
     }
 
-    /// Loads the producer's tail now, with the checks `pop` makes, and
-    /// takes nothing. The engine uses it to see entries published while
-    /// the queue is paused.
+    /// Loads and checks the tail without taking anything. The engine uses
+    /// it to see entries published while the queue is paused.
     pub fn load_tail(&mut self) -> Result<u32, Broken> {
         let t = self
             .ends
@@ -388,9 +375,9 @@ impl<const N: usize> Consumer<N> {
             .store(self.head, Ordering::Release);
     }
 
-    /// Steps 1 and 2 of the wake-up state machine (spec 37 §4). Returns true
-    /// if the ring is still empty and the caller may wait for a wake-up;
-    /// it must then call [`Consumer::woke`] after the wake-up read.
+    /// Sets the idle flag and checks the ring again. Returns true if it is
+    /// still empty and the caller may wait; it must then call
+    /// [`Consumer::woke`] after the wake-up read.
     pub fn prepare_wait(&mut self) -> Result<bool, Broken> {
         let region = Arc::clone(&self.ends.region);
         let idle = region.u32_at(self.ends.idle);
@@ -405,7 +392,7 @@ impl<const N: usize> Consumer<N> {
         Ok(true)
     }
 
-    /// Step 3, after the wake-up read: not waiting any more.
+    /// Clears the idle flag.
     pub fn woke(&mut self) {
         self.ends
             .region
@@ -413,8 +400,8 @@ impl<const N: usize> Consumer<N> {
             .store(0, Ordering::Relaxed);
     }
 
-    /// A tail is valid if it is at most `depth` entries past our head and
-    /// not behind the tail we saw last.
+    /// A valid tail is at most `depth` past our head and not behind the
+    /// last tail seen.
     fn see_tail(&mut self, t: u32) -> Result<(), Broken> {
         let ahead = t.wrapping_sub(self.head);
         if ahead > self.ends.depth || ahead < self.tail.wrapping_sub(self.head) {

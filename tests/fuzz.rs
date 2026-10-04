@@ -57,8 +57,7 @@ proptest! {
             let mut b = [0u8; SQE_BYTES];
             b.copy_from_slice(&bytes);
             if steer {
-                // Make about half the entries pass the cheap checks, so the
-                // range and buffer checks see real work.
+                // Pass the cheap checks so the range and buffer checks run.
                 b[8..16].copy_from_slice(&3u64.to_le_bytes());
                 b[6..8].copy_from_slice(&0u16.to_le_bytes());
                 b[50] = 1 + b[50] % 3;

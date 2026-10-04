@@ -1,15 +1,8 @@
 //! The shared-memory ring between rust-bhyve and the MantaBlock engine.
-//! Section numbers (§) in the docs refer to the MantaBlock ring
-//! specification, version 1.
 //!
-//! Both sides use this crate, so the layout, the entry formats, the ring
-//! operations and the checks exist once. It has no dependencies and does no
-//! I/O: each side maps the region, passes descriptors and runs its own
-//! sockets and pipes.
-//!
-//! The engine treats everything rust-bhyve writes as hostile. Only `ring`
-//! touches shared memory, and only with atomics; every request goes through
-//! [`check::QueueState::check`] before the engine uses it.
+//! No dependencies and no I/O: each side maps the region and runs its own
+//! sockets and pipes. The engine treats everything rust-bhyve writes as
+//! hostile, so every request goes through [`check::QueueState::check`].
 
 pub mod check;
 pub mod control;
