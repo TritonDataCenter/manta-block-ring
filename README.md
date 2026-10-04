@@ -9,7 +9,7 @@ The crate has no dependencies and does no I/O. Each side maps the region, passes
 - The engine and the VMM share one region: a tmpfs file that the engine creates and sends over a Unix socket with `SCM_RIGHTS`.
 - Each guest queue has one submission ring (SQ, 64-byte entries) and one completion ring (CQ, 32-byte entries), plus a buffer area. The engine never maps guest memory. The VMM copies data into and out of the buffer area.
 - Each side sleeps on its own pipe. A side sends a wake-up only when the other side says it is idle.
-- The engine treats everything the VMM writes as hostile. Only `ring.rs` touches shared memory, and only with atomics. Every request goes through `QueueState::check` before the engine uses it.
+- The engine treats everything the VMM writes as hostile. Only `ring.rs` touches shared memory: atomics for the rings, and an inline-asm copy for the buffer area. Every request goes through `QueueState::check` before the engine uses it.
 
 ## Region layout, version 1
 
