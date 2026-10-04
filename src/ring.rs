@@ -1,9 +1,9 @@
 //! Moving entries and data through the shared region.
 //!
 //! The peer can write any byte at any time, so every access here is an
-//! atomic, never a plain reference or `copy_nonoverlapping`. A torn entry is
-//! then only bad input for the checks. Each side keeps its own index in
-//! private memory and never reads its own field back.
+//! atomic or a bulk copy, never a plain reference or `copy_nonoverlapping`.
+//! A torn entry is then only bad input for the checks. Each side keeps its
+//! own index in private memory and never reads its own field back.
 
 #![allow(unsafe_code)]
 
@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use crate::error::{Broken, LayoutError};
 use crate::layout::{CQE_BYTES, Geometry, HEADER_BYTES, Header, PAGE, SQE_BYTES, control};
 
-/// A mapped region. All access goes through atomics.
+/// A mapped region. All access goes through atomics or bulk copies.
 pub struct Region {
     base: NonNull<u8>,
     geometry: Geometry,
@@ -33,10 +33,10 @@ impl fmt::Debug for Region {
     }
 }
 
-// SAFETY: only atomic access, to memory that stays mapped while the Region
-// lives.
+// SAFETY: only atomic or `bulk` access, to memory that stays mapped while
+// the Region lives.
 unsafe impl Send for Region {}
-// SAFETY: as for Send; shared references only allow atomic access.
+// SAFETY: shared references only allow atomic or `bulk` access.
 unsafe impl Sync for Region {}
 
 impl Region {
@@ -100,26 +100,47 @@ impl Region {
 
     fn u64_at(&self, off: usize) -> &AtomicU64 {
         debug_assert!(off.is_multiple_of(8) && off + 8 <= self.geometry.region_len());
-        // SAFETY: as in `u32_at`, with 8-byte alignment.
+        // SAFETY: `off` comes from the checked geometry, so it is in the
+        // mapping and 8-byte aligned on a page-aligned base.
         unsafe { AtomicU64::from_ptr(self.base.as_ptr().add(off).cast()) }
     }
 
     /// `out.len()` and `off` must be multiples of 8 and inside the region.
     fn load(&self, off: usize, out: &mut [u8]) {
-        for (i, chunk) in out.chunks_exact_mut(8).enumerate() {
-            let v = self.u64_at(off + i * 8).load(Ordering::Relaxed);
-            chunk.copy_from_slice(&v.to_ne_bytes());
+        let (chunks, tail) = out.as_chunks_mut::<8>();
+        debug_assert!(tail.is_empty());
+        for (i, chunk) in chunks.iter_mut().enumerate() {
+            *chunk = self
+                .u64_at(off + i * 8)
+                .load(Ordering::Relaxed)
+                .to_ne_bytes();
         }
     }
 
-    /// Same rules as `load`.
+    /// `data.len()` and `off` must be multiples of 8 and inside the region.
     fn store(&self, off: usize, data: &[u8]) {
-        for (i, chunk) in data.chunks_exact(8).enumerate() {
-            let mut v = [0u8; 8];
-            v.copy_from_slice(chunk);
+        let (chunks, tail) = data.as_chunks::<8>();
+        debug_assert!(tail.is_empty());
+        for (i, chunk) in chunks.iter().enumerate() {
             self.u64_at(off + i * 8)
-                .store(u64::from_ne_bytes(v), Ordering::Relaxed);
+                .store(u64::from_ne_bytes(*chunk), Ordering::Relaxed);
         }
+    }
+
+    // In this process the buffer area is never accessed concurrently at
+    // another width.
+    fn load_bulk(&self, off: usize, out: &mut [u8]) {
+        debug_assert!(off + out.len() <= self.geometry.region_len());
+        // SAFETY: the range is inside the mapping, which outlives `&self`.
+        // `out` is ours and cannot overlap it.
+        unsafe { bulk::load(self.base.as_ptr().add(off), out) }
+    }
+
+    fn store_bulk(&self, off: usize, data: &[u8]) {
+        debug_assert!(off + data.len() <= self.geometry.region_len());
+        // SAFETY: the range is inside the mapping, which outlives `&self`.
+        // `data` is ours and cannot overlap it.
+        unsafe { bulk::store(data, self.base.as_ptr().add(off)) }
     }
 
     /// The engine calls this once, before it sends the region.
@@ -139,7 +160,7 @@ impl Region {
     pub fn read_buffer(&self, q: u16, page: u32, out: &mut [u8]) -> bool {
         match self.buffer_range(q, page, out.len()) {
             Some(off) => {
-                self.load(off, out);
+                self.load_bulk(off, out);
                 true
             }
             None => false,
@@ -150,7 +171,7 @@ impl Region {
     pub fn write_buffer(&self, q: u16, page: u32, data: &[u8]) -> bool {
         match self.buffer_range(q, page, data.len()) {
             Some(off) => {
-                self.store(off, data);
+                self.store_bulk(off, data);
                 true
             }
             None => false,
@@ -224,6 +245,69 @@ impl Region {
         use control::{CQ_HEAD, CQ_TAIL, VMM_IDLE};
         self.ends(q, Ring::Cq, CQ_HEAD, CQ_TAIL, VMM_IDLE)
             .map(Consumer::new)
+    }
+}
+
+/// Copies of the buffer area that a racing peer write cannot make undefined.
+///
+/// A plain copy that races a write is a data race even if the bytes are never
+/// trusted. We assume the asm copy behaves like a relaxed `AtomicU8` copy per
+/// byte, which is what the fallback does, so a race only tears the data. The
+/// asm is not `nomem`, so the index `Acquire` and `Release` order it.
+mod bulk {
+    #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// # Safety
+    ///
+    /// `src` is valid for `out.len()` bytes and does not overlap `out`.
+    /// Another process may write it at any time; in this process other
+    /// threads touch it only through `load` and `store`.
+    pub(super) unsafe fn load(src: *const u8, out: &mut [u8]) {
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        // SAFETY: the caller's guarantee.
+        unsafe {
+            movsb(src, out.as_mut_ptr(), out.len());
+        }
+        #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+        for (i, b) in out.iter_mut().enumerate() {
+            // SAFETY: the caller's guarantee.
+            *b = unsafe { AtomicU8::from_ptr(src.add(i).cast_mut()) }.load(Ordering::Relaxed);
+        }
+    }
+
+    /// # Safety
+    ///
+    /// `dst` is valid for `data.len()` bytes and does not overlap `data`.
+    /// Another process may write it at any time; in this process other
+    /// threads touch it only through `load` and `store`.
+    pub(super) unsafe fn store(data: &[u8], dst: *mut u8) {
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        // SAFETY: the caller's guarantee.
+        unsafe {
+            movsb(data.as_ptr(), dst, data.len());
+        }
+        #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+        for (i, &b) in data.iter().enumerate() {
+            // SAFETY: the caller's guarantee.
+            unsafe { AtomicU8::from_ptr(dst.add(i)) }.store(b, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    unsafe fn movsb(src: *const u8, dst: *mut u8, len: usize) {
+        // Rust's inline-asm rules guarantee the direction flag is clear on
+        // entry.
+        // SAFETY: the caller's guarantee.
+        unsafe {
+            std::arch::asm!(
+                "rep movsb",
+                inout("rcx") len => _,
+                inout("rsi") src => _,
+                inout("rdi") dst => _,
+                options(nostack, preserves_flags),
+            );
+        }
     }
 }
 
@@ -409,5 +493,144 @@ impl<const N: usize> Consumer<N> {
         }
         self.tail = t;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::alloc::{Layout, alloc_zeroed};
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    use super::*;
+
+    /// Never freed, so it outlives the Region.
+    fn region(buf_pages: u32) -> Region {
+        let g = Geometry::new(1, 2, buf_pages).unwrap();
+        let layout = Layout::from_size_align(g.region_len(), PAGE).unwrap();
+        // SAFETY: the layout has a non-zero size.
+        let base = unsafe { alloc_zeroed(layout) };
+        assert!(!base.is_null());
+        // SAFETY: a fresh, never-freed allocation only used through the
+        // Region.
+        unsafe { Region::from_raw_parts(base, g.region_len(), g) }.unwrap()
+    }
+
+    fn pattern(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bulk_copies_match_the_atomic_path() {
+        let r = region(4);
+        let end = r.geometry().region_len();
+        let lens: &[usize] = if cfg!(miri) {
+            &[0, 8, 24, 4096]
+        } else {
+            &[
+                0, 8, 16, 24, 56, 64, 72, 504, 4088, 4096, 4104, 8192, 12_288,
+            ]
+        };
+        let offs: &[usize] = if cfg!(miri) {
+            &[0, 8, 4096 + 40]
+        } else {
+            &[0, 8, 16, 40, 4096 - 8, 4096, 4096 + 8, 2 * 4096 + 24]
+        };
+        for &len in lens {
+            for &off in offs {
+                let off = r.geometry().buf_offset(0) + off;
+                if off + len > end {
+                    continue;
+                }
+                let data = pattern(len, (len ^ off) as u64);
+                r.store(off, &data);
+                let (mut old, mut new) = (vec![0u8; len], vec![0u8; len]);
+                r.load(off, &mut old);
+                r.load_bulk(off, &mut new);
+                assert_eq!(old, data, "len {len} off {off}");
+                assert_eq!(new, data, "len {len} off {off}");
+
+                let data = pattern(len, !(len ^ off) as u64);
+                r.store_bulk(off, &data);
+                r.load(off, &mut old);
+                assert_eq!(old, data, "len {len} off {off}");
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_copy_handles_any_alignment_and_length() {
+        let mut src = pattern(1024 + 16, 7);
+        let (lens, shifts) = if cfg!(miri) {
+            (vec![0, 1, 7, 8, 15, 16, 17, 31, 33], 0..3)
+        } else {
+            (
+                (0..=80).chain([127, 255, 504, 1021, 1023, 1024]).collect(),
+                0..16,
+            )
+        };
+        for len in lens {
+            for s in shifts.clone() {
+                for d in shifts.clone() {
+                    let mut dst = vec![0u8; 1024 + 32];
+                    // SAFETY: both ranges are in bounds of separate vectors.
+                    unsafe { bulk::load(src.as_mut_ptr().add(s), &mut dst[d..d + len]) };
+                    assert_eq!(&dst[d..d + len], &src[s..s + len]);
+                    assert!(dst[..d].iter().all(|&b| b == 0));
+                    assert!(dst[d + len..].iter().all(|&b| b == 0));
+
+                    let mut dst = vec![0u8; 1024 + 32];
+                    // SAFETY: both ranges are in bounds of separate vectors.
+                    unsafe { bulk::store(&src[s..s + len], dst.as_mut_ptr().add(d)) };
+                    assert_eq!(&dst[d..d + len], &src[s..s + len]);
+                    assert!(dst[..d].iter().all(|&b| b == 0));
+                    assert!(dst[d + len..].iter().all(|&b| b == 0));
+                }
+            }
+        }
+    }
+
+    /// `cargo test --release --lib -- --ignored --nocapture bulk_copy_speed`
+    #[test]
+    #[ignore = "benchmark"]
+    fn bulk_copy_speed() {
+        let r = region(32);
+        let off = r.geometry().buf_offset(0);
+        for len in [4096, 16 << 10, 64 << 10, 128 << 10] {
+            let out = vec![0u8; len];
+            let iters = (256 << 20) / len;
+            let time = |f: &dyn Fn(&mut [u8])| {
+                let mut out = out.clone();
+                f(&mut out);
+                let t = Instant::now();
+                for _ in 0..iters {
+                    f(black_box(&mut out));
+                }
+                t.elapsed().as_nanos() as f64 / iters as f64
+            };
+            let old_read = time(&|o| r.load(off, o));
+            let new_read = time(&|o| r.load_bulk(off, o));
+            let old_write = time(&|o| r.store(off, o));
+            let new_write = time(&|o| r.store_bulk(off, o));
+            let mut plain = vec![0u8; len];
+            let t = Instant::now();
+            for _ in 0..iters {
+                black_box(&mut plain).copy_from_slice(black_box(&out));
+            }
+            let memcpy = t.elapsed().as_nanos() as f64 / iters as f64;
+            println!(
+                "{:>4} KiB  read old {old_read:>8.0} new {new_read:>8.0}  \
+                 write old {old_write:>8.0} new {new_write:>8.0}  memcpy {memcpy:>8.0} ns",
+                len >> 10
+            );
+        }
     }
 }

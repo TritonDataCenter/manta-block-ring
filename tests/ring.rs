@@ -38,8 +38,8 @@ fn poke(base: usize, off: usize, v: u32) {
         .store(v, Ordering::SeqCst);
 }
 
-/// The ring reads entries and buffers as 64-bit atomics, so a test must
-/// not store them with another size.
+/// The ring reads SQ and CQ entries as 64-bit atomics, so a test must not
+/// store them with another size.
 fn poke64(base: usize, off: usize, v: u64) {
     // SAFETY: `off` is 8-byte aligned in the region and only accessed as a
     // 64-bit atomic.
@@ -143,6 +143,32 @@ fn buffers_stay_inside_their_queue() {
     assert!(!r.write_buffer(0, 0, &data[..7]), "not a multiple of 8");
 }
 
+/// A smoke test only: it can catch a copy that invents bytes, but it cannot
+/// prove the copy free of undefined behavior.
+#[test]
+fn a_buffer_read_during_a_write_gets_some_mix_of_bytes() {
+    let g = Geometry::new(1, 2, 32).unwrap();
+    let (r, _) = region(g);
+    let len = if cfg!(miri) { 64 } else { 32 * PAGE };
+    let rounds = if cfg!(miri) { 20 } else { 2_000 };
+    let stop = Arc::new(AtomicBool::new(false));
+    let (w, s) = (Arc::clone(&r), Arc::clone(&stop));
+    let writer = thread::spawn(move || {
+        let (a, b) = (vec![0xaau8; len], vec![0x55u8; len]);
+        while !s.load(Ordering::Relaxed) {
+            assert!(w.write_buffer(0, 0, &a));
+            assert!(w.write_buffer(0, 0, &b));
+        }
+    });
+    let mut out = vec![0u8; len];
+    for _ in 0..rounds {
+        assert!(r.read_buffer(0, 0, &mut out));
+        assert!(out.iter().all(|&b| b == 0 || b == 0xaa || b == 0x55));
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+}
+
 #[test]
 fn header_written_by_the_engine_reads_back() {
     let g = Geometry::new(3, 16, 2).unwrap();
@@ -169,15 +195,18 @@ fn wake(tx: &SyncSender<()>) {
     }
 }
 
-/// Blocks until woken. A lost wake-up shows up as a timeout.
+/// Blocks until woken. A lost wake-up shows up as a timeout. Miri's clock
+/// runs with the code it executes, so there a busy peer needs much longer.
 fn wait(rx: &Receiver<()>) {
-    rx.recv_timeout(Duration::from_secs(10))
+    let secs = if cfg!(miri) { 3600 } else { 10 };
+    rx.recv_timeout(Duration::from_secs(secs))
         .expect("lost wake-up: nobody woke the waiting side");
 }
 
 #[test]
 fn two_threads_move_every_request_and_completion() {
-    const N: u64 = 200_000;
+    const N: u64 = if cfg!(miri) { 300 } else { 200_000 };
+    let len = if cfg!(miri) { 64 } else { PAGE };
     let depth = 64;
     let g = Geometry::new(1, depth, depth).unwrap();
     let (r, _) = region(g);
@@ -197,7 +226,7 @@ fn two_threads_move_every_request_and_completion() {
         };
         let mut q = QueueState::new(0, limits, 0);
         let mut done = 0u64;
-        let mut page = vec![0u8; PAGE];
+        let mut page = vec![0u8; len];
         while done < N {
             let mut worked = false;
             while q.can_take() {
@@ -240,7 +269,7 @@ fn two_threads_move_every_request_and_completion() {
         let mut sent = false;
         while next < N {
             let Some(tag) = out.free_tag() else { break };
-            let page = vec![next as u8; PAGE];
+            let page = vec![next as u8; len];
             assert!(r.write_buffer(0, u32::from(tag), &page));
             let id = OpId {
                 generation: GEN,
