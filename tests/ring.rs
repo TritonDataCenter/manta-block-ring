@@ -366,3 +366,24 @@ fn the_consumer_rechecks_before_it_sleeps() {
     eng.woke();
     assert!(eng.pop().unwrap().is_some());
 }
+
+#[test]
+fn the_consumer_reports_the_tail_it_has_seen() {
+    let g = Geometry::new(1, 4, 1).unwrap();
+    let (r, base) = region(g);
+    let mut sq = r.sq_producer(0).unwrap();
+    let mut eng = r.sq_consumer(0).unwrap();
+    assert!(sq.try_push(&sqe(0, 0, 0, 0).encode()).unwrap());
+    sq.publish();
+    assert!(eng.pop().unwrap().is_some());
+    assert_eq!(eng.pop().unwrap(), None);
+    assert_eq!(eng.seen_tail(), 1);
+    assert_eq!(eng.load_tail(), Ok(1));
+    assert!(sq.try_push(&sqe(1, 1, 0, 0).encode()).unwrap());
+    sq.publish();
+    assert_eq!(eng.load_tail(), Ok(2));
+    assert_eq!(eng.seen_tail(), 2);
+    // A tail that goes back is broken here too.
+    poke(base, PAGE + control::SQ_TAIL, 1);
+    assert_eq!(eng.load_tail(), Err(Broken));
+}

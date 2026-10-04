@@ -360,6 +360,26 @@ impl<const N: usize> Consumer<N> {
         Ok(Some(e))
     }
 
+    /// The producer's tail as this consumer last loaded it. After a
+    /// [`Consumer::pop`] that returned `None`, every entry up to it is
+    /// taken.
+    pub fn seen_tail(&self) -> u32 {
+        self.tail
+    }
+
+    /// Loads the producer's tail now, with the checks `pop` makes, and
+    /// takes nothing. The engine uses it to see entries published while
+    /// the queue is paused.
+    pub fn load_tail(&mut self) -> Result<u32, Broken> {
+        let t = self
+            .ends
+            .region
+            .u32_at(self.ends.peer)
+            .load(Ordering::Acquire);
+        self.see_tail(t)?;
+        Ok(t)
+    }
+
     /// Hands every popped slot back to the producer.
     pub fn release(&mut self) {
         self.ends
