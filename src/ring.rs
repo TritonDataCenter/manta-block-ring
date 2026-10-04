@@ -11,6 +11,8 @@
 
 #![allow(unsafe_code)]
 
+use std::any::Any;
+use std::fmt;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
@@ -19,10 +21,21 @@ use crate::error::{Broken, LayoutError};
 use crate::layout::{CQE_BYTES, Geometry, HEADER_BYTES, Header, PAGE, SQE_BYTES, control};
 
 /// A mapped region. All access goes through atomics.
-#[derive(Debug)]
 pub struct Region {
     base: NonNull<u8>,
     geometry: Geometry,
+    // Dropped with the Region, so whatever keeps the mapping alive lives as
+    // long as the last ring handle.
+    _owner: Option<Box<dyn Any + Send + Sync>>,
+}
+
+impl fmt::Debug for Region {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Region")
+            .field("base", &self.base)
+            .field("geometry", &self.geometry)
+            .finish_non_exhaustive()
+    }
 }
 
 // SAFETY: a Region only hands out atomic accesses to memory that, by the
@@ -51,7 +64,32 @@ impl Region {
         if !(base.as_ptr() as usize).is_multiple_of(PAGE) || len < geometry.region_len() {
             return Err(LayoutError::Mapping);
         }
-        Ok(Self { base, geometry })
+        Ok(Self {
+            base,
+            geometry,
+            _owner: None,
+        })
+    }
+
+    /// As [`Region::from_raw_parts`], and the region keeps `owner` until it
+    /// is dropped. Use this when `owner` unmaps the mapping on drop: the
+    /// mapping then outlives every handle made from the region.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Region::from_raw_parts`], except that the mapping must stay
+    /// valid only until `owner` is dropped.
+    pub unsafe fn with_owner(
+        base: *mut u8,
+        len: usize,
+        geometry: Geometry,
+        owner: impl Any + Send + Sync,
+    ) -> Result<Self, LayoutError> {
+        // SAFETY: the caller's guarantee, extended by `owner`, which the
+        // Region holds until its last reference is gone.
+        let mut r = unsafe { Self::from_raw_parts(base, len, geometry) }?;
+        r._owner = Some(Box::new(owner));
+        Ok(r)
     }
 
     /// The geometry the region was made with.
