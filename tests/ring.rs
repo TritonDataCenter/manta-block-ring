@@ -31,11 +31,21 @@ fn region(g: Geometry) -> (Arc<Region>, usize) {
     (Arc::new(r), base as usize)
 }
 
-/// Writes a u32 into the region as the other process would.
+/// Writes a control field as the other process would. Control fields are
+/// 32-bit atomics on both sides.
 fn poke(base: usize, off: usize, v: u32) {
-    // SAFETY: `off` is inside the test region and 4-byte aligned, and the
-    // region is only accessed with atomics.
+    // SAFETY: `off` is a 4-byte aligned control field inside the test
+    // region, which is only accessed with 32-bit atomics there.
     unsafe { std::sync::atomic::AtomicU32::from_ptr((base + off) as *mut u32) }
+        .store(v, Ordering::SeqCst);
+}
+
+/// Writes 8 bytes of an entry or buffer area. The ring reads those as
+/// 64-bit atomics, so a test must not store them with another size.
+fn poke64(base: usize, off: usize, v: u64) {
+    // SAFETY: `off` is 8-byte aligned inside the test region, and this
+    // range is only accessed with 64-bit atomics.
+    unsafe { std::sync::atomic::AtomicU64::from_ptr((base + off) as *mut u64) }
         .store(v, Ordering::SeqCst);
 }
 
@@ -282,10 +292,13 @@ fn a_peer_writing_garbage_never_panics_the_engine() {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            // Anywhere in the control page and the rings, 4-byte aligned.
-            let off = (PAGE + (x as usize) % (3 * PAGE)) & !3;
-            if off + 4 <= len {
-                poke(base, off, (x >> 32) as u32);
+            // Anywhere in the control page and the rings, with the access
+            // size the ring uses there.
+            let off = PAGE + (x as usize) % (3 * PAGE);
+            if off < 2 * PAGE {
+                poke(base, off & !3, (x >> 32) as u32);
+            } else if (off & !7) + 8 <= len {
+                poke64(base, off & !7, x);
             }
         }
     });
