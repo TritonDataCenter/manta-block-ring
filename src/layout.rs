@@ -4,8 +4,8 @@
 //! page 0                    region header
 //! for each queue q:
 //!   1 page                  queue control (indices and flags)
-//!   depth × 64 B            submission ring
-//!   depth × 32 B            completion ring
+//!   depth × 64 B            submission ring, padded to a page
+//!   depth × 32 B            completion ring, padded to a page
 //!   buf_pages × 4 KiB       buffer area
 //! ```
 //!
@@ -64,6 +64,7 @@ pub struct Geometry {
     queues: u16,
     depth: u32,
     buf_pages: u32,
+    sq_bytes: usize,
     queue_bytes: usize,
     region_len: usize,
 }
@@ -80,11 +81,11 @@ impl Geometry {
         if buf_pages == 0 || buf_pages > MAX_BUF_PAGES {
             return Err(LayoutError::BufPages(buf_pages));
         }
-        let rings = (depth as usize)
-            .checked_mul(SQE_BYTES + CQE_BYTES)
-            .ok_or(LayoutError::TooLarge)?;
-        let queue_bytes = round_up(PAGE + rings)
-            .and_then(|b| b.checked_add((buf_pages as usize).checked_mul(PAGE)?))
+        let sq_bytes = ring_bytes(depth, SQE_BYTES).ok_or(LayoutError::TooLarge)?;
+        let cq_bytes = ring_bytes(depth, CQE_BYTES).ok_or(LayoutError::TooLarge)?;
+        let queue_bytes = (buf_pages as usize)
+            .checked_mul(PAGE)
+            .and_then(|b| b.checked_add(PAGE + sq_bytes + cq_bytes))
             .ok_or(LayoutError::TooLarge)?;
         let region_len = queue_bytes
             .checked_mul(usize::from(queues))
@@ -94,6 +95,7 @@ impl Geometry {
             queues,
             depth,
             buf_pages,
+            sq_bytes,
             queue_bytes,
             region_len,
         })
@@ -136,7 +138,7 @@ impl Geometry {
 
     /// Offset of queue `q`'s completion ring.
     pub(crate) fn cq_offset(&self, q: u16) -> usize {
-        self.sq_offset(q) + self.depth as usize * SQE_BYTES
+        self.sq_offset(q) + self.sq_bytes
     }
 
     /// Offset of queue `q`'s buffer area.
@@ -145,8 +147,12 @@ impl Geometry {
     }
 }
 
-fn round_up(n: usize) -> Option<usize> {
-    n.checked_add(PAGE - 1).map(|v| v & !(PAGE - 1))
+/// Bytes of one ring, padded to a page so the next block is page-aligned.
+fn ring_bytes(depth: u32, entry: usize) -> Option<usize> {
+    (depth as usize)
+        .checked_mul(entry)?
+        .checked_add(PAGE - 1)
+        .map(|v| v & !(PAGE - 1))
 }
 
 /// The region header in page 0. It is informative: each side keeps the
@@ -219,7 +225,12 @@ mod tests {
     fn offsets_are_page_aligned_and_inside_the_region() {
         let g = Geometry::new(3, 1024, 256).unwrap();
         for q in 0..3 {
-            for off in [g.queue_offset(q), g.sq_offset(q), g.buf_offset(q)] {
+            for off in [
+                g.queue_offset(q),
+                g.sq_offset(q),
+                g.cq_offset(q),
+                g.buf_offset(q),
+            ] {
                 assert_eq!(off % PAGE, 0);
             }
             assert!(g.cq_offset(q) + 1024 * CQE_BYTES <= g.buf_offset(q));
@@ -231,6 +242,29 @@ mod tests {
         assert_eq!(g.region_len(), PAGE + 3 * g.queue_bytes());
         // 1024 × 96 B = 24 pages of rings after the control page.
         assert_eq!(g.queue_bytes(), (1 + 24 + 256) * PAGE);
+    }
+
+    #[test]
+    fn every_block_is_page_aligned_at_every_depth() {
+        let mut depth = MIN_DEPTH;
+        while depth <= MAX_DEPTH {
+            let g = Geometry::new(2, depth, 1).unwrap();
+            for q in 0..2 {
+                for off in [
+                    g.queue_offset(q),
+                    g.sq_offset(q),
+                    g.cq_offset(q),
+                    g.buf_offset(q),
+                ] {
+                    assert_eq!(off % PAGE, 0, "depth {depth}");
+                }
+                assert!(g.sq_offset(q) + depth as usize * SQE_BYTES <= g.cq_offset(q));
+                assert!(g.cq_offset(q) + depth as usize * CQE_BYTES <= g.buf_offset(q));
+            }
+            depth *= 2;
+        }
+        // Small rings take a page each.
+        assert_eq!(Geometry::new(1, 16, 1).unwrap().queue_bytes(), 4 * PAGE);
     }
 
     #[test]

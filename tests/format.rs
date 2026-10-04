@@ -22,6 +22,18 @@ fn header_bytes() {
     assert_eq!(hex(&h.encode()), HEADER);
 }
 
+/// A ring smaller than a page still takes a whole page, so the completion
+/// ring and the buffer area start on a page.
+#[test]
+fn small_ring_header_bytes() {
+    let h = Header {
+        geometry: Geometry::new(1, 16, 2).unwrap(),
+        volume_blocks: 0x0102_0304,
+        attach_generation: 0x0a0b,
+    };
+    assert_eq!(hex(&h.encode()), SMALL_HEADER);
+}
+
 #[test]
 fn entry_bytes() {
     let e = Sqe {
@@ -81,6 +93,7 @@ fn control_bytes() {
 }
 
 const HEADER: &str = "4d42524701000200000100004000000000f0080000000000007004000000000004030201000000000b0a000000000000";
+const SMALL_HEADER: &str = "4d4252470100010010000000020000000060000000000000005000000000000004030201000000000b0a000000000000";
 const SQE: &str = "ddccbbaa0000030088776655443322111000000000000000020000000500000000ccbbaa00000000990000000000000007000200000000000000000000000000";
 const CQE: &str = "0700050000000000ddccbbaa0000030034120000560000000000000000000000";
 const ATTACH: &str = "3200000003000100010000003031323334353637383961626364656600000000000000000400000100000002000000020000";
