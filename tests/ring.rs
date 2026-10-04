@@ -38,8 +38,8 @@ fn poke(base: usize, off: usize, v: u32) {
         .store(v, Ordering::SeqCst);
 }
 
-/// The ring reads entries and buffers as 64-bit atomics, so a test must
-/// not store them with another size.
+/// The ring reads SQ and CQ entries as 64-bit atomics, so a test must not
+/// store them with another size.
 fn poke64(base: usize, off: usize, v: u64) {
     // SAFETY: `off` is 8-byte aligned in the region and only accessed as a
     // 64-bit atomic.
@@ -143,6 +143,8 @@ fn buffers_stay_inside_their_queue() {
     assert!(!r.write_buffer(0, 0, &data[..7]), "not a multiple of 8");
 }
 
+/// A smoke test only: it can catch a copy that invents bytes, but it cannot
+/// prove the copy free of undefined behavior.
 #[test]
 fn a_buffer_read_during_a_write_gets_some_mix_of_bytes() {
     let g = Geometry::new(1, 2, 32).unwrap();
