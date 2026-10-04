@@ -1,5 +1,6 @@
-//! The shared-memory ring between rust-bhyve and the MantaBlock engine
-//! (`docs/plan/37-mantablock-ring-spec.md`).
+//! The shared-memory ring between rust-bhyve and the MantaBlock engine.
+//! Section numbers (§) in the docs refer to the MantaBlock ring
+//! specification, version 1.
 //!
 //! Both sides use this crate, so the layout, the entry formats, the ring
 //! operations and the checks exist once. It has no dependencies and does no

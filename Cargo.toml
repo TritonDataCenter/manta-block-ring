@@ -1,21 +1,24 @@
 [package]
 name = "manta-block-ring"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-authors.workspace = true
-repository.workspace = true
-description = "Shared-memory ring between rust-bhyve and the MantaBlock engine (spec 37)"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MPL-2.0"
+authors = ["Triton DataCenter"]
+repository = "https://github.com/TritonDataCenter/manta-block-ring"
+description = "Shared-memory ring between rust-bhyve and the MantaBlock engine"
+keywords = ["nvme", "ring", "shared-memory", "bhyve"]
+categories = ["os", "concurrency"]
 
-# rust-bhyve depends on this crate too, so it has no dependencies.
+# rust-bhyve and the engine both depend on this crate, so it has no
+# dependencies.
 [dependencies]
 
 [dev-dependencies]
-proptest.workspace = true
+proptest = "1"
 
-# The workspace forbids unsafe code. Only `ring.rs`, which reads and writes
-# the shared mapping, allows it; everywhere else it stays denied.
+# Only `ring.rs`, which reads and writes the shared mapping, allows unsafe
+# code.
 [lints.rust]
 missing_docs = "deny"
 unsafe_code = "deny"

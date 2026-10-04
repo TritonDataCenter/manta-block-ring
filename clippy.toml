@@ -1,0 +1,8 @@
+# The workspace lint policy (root Cargo.toml) denies unwrap_used and
+# expect_used so production code cannot panic under the panic=abort
+# profile. Tests assert with unwrap/expect by design, so allow them in
+# test contexts only; this keeps `cargo clippy --all-targets` green
+# without weakening the production gate.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
