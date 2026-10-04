@@ -144,6 +144,30 @@ fn buffers_stay_inside_their_queue() {
 }
 
 #[test]
+fn a_buffer_read_during_a_write_gets_some_mix_of_bytes() {
+    let g = Geometry::new(1, 2, 32).unwrap();
+    let (r, _) = region(g);
+    let len = if cfg!(miri) { 64 } else { 32 * PAGE };
+    let rounds = if cfg!(miri) { 20 } else { 2_000 };
+    let stop = Arc::new(AtomicBool::new(false));
+    let (w, s) = (Arc::clone(&r), Arc::clone(&stop));
+    let writer = thread::spawn(move || {
+        let (a, b) = (vec![0xaau8; len], vec![0x55u8; len]);
+        while !s.load(Ordering::Relaxed) {
+            assert!(w.write_buffer(0, 0, &a));
+            assert!(w.write_buffer(0, 0, &b));
+        }
+    });
+    let mut out = vec![0u8; len];
+    for _ in 0..rounds {
+        assert!(r.read_buffer(0, 0, &mut out));
+        assert!(out.iter().all(|&b| b == 0 || b == 0xaa || b == 0x55));
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+}
+
+#[test]
 fn header_written_by_the_engine_reads_back() {
     let g = Geometry::new(3, 16, 2).unwrap();
     let (r, _) = region(g);
