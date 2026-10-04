@@ -195,15 +195,18 @@ fn wake(tx: &SyncSender<()>) {
     }
 }
 
-/// Blocks until woken. A lost wake-up shows up as a timeout.
+/// Blocks until woken. A lost wake-up shows up as a timeout. Miri's clock
+/// runs with the code it executes, so there a busy peer needs much longer.
 fn wait(rx: &Receiver<()>) {
-    rx.recv_timeout(Duration::from_secs(10))
+    let secs = if cfg!(miri) { 3600 } else { 10 };
+    rx.recv_timeout(Duration::from_secs(secs))
         .expect("lost wake-up: nobody woke the waiting side");
 }
 
 #[test]
 fn two_threads_move_every_request_and_completion() {
-    const N: u64 = 200_000;
+    const N: u64 = if cfg!(miri) { 300 } else { 200_000 };
+    let len = if cfg!(miri) { 64 } else { PAGE };
     let depth = 64;
     let g = Geometry::new(1, depth, depth).unwrap();
     let (r, _) = region(g);
@@ -223,7 +226,7 @@ fn two_threads_move_every_request_and_completion() {
         };
         let mut q = QueueState::new(0, limits, 0);
         let mut done = 0u64;
-        let mut page = vec![0u8; PAGE];
+        let mut page = vec![0u8; len];
         while done < N {
             let mut worked = false;
             while q.can_take() {
@@ -266,7 +269,7 @@ fn two_threads_move_every_request_and_completion() {
         let mut sent = false;
         while next < N {
             let Some(tag) = out.free_tag() else { break };
-            let page = vec![next as u8; PAGE];
+            let page = vec![next as u8; len];
             assert!(r.write_buffer(0, u32::from(tag), &page));
             let id = OpId {
                 generation: GEN,
