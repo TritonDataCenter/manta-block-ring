@@ -106,19 +106,23 @@ impl Region {
 
     /// `out.len()` and `off` must be multiples of 8 and inside the region.
     fn load(&self, off: usize, out: &mut [u8]) {
-        for (i, chunk) in out.chunks_exact_mut(8).enumerate() {
-            let v = self.u64_at(off + i * 8).load(Ordering::Relaxed);
-            chunk.copy_from_slice(&v.to_ne_bytes());
+        let (chunks, tail) = out.as_chunks_mut::<8>();
+        debug_assert!(tail.is_empty());
+        for (i, chunk) in chunks.iter_mut().enumerate() {
+            *chunk = self
+                .u64_at(off + i * 8)
+                .load(Ordering::Relaxed)
+                .to_ne_bytes();
         }
     }
 
-    /// Same rules as `load`.
+    /// `data.len()` and `off` must be multiples of 8 and inside the region.
     fn store(&self, off: usize, data: &[u8]) {
-        for (i, chunk) in data.chunks_exact(8).enumerate() {
-            let mut v = [0u8; 8];
-            v.copy_from_slice(chunk);
+        let (chunks, tail) = data.as_chunks::<8>();
+        debug_assert!(tail.is_empty());
+        for (i, chunk) in chunks.iter().enumerate() {
             self.u64_at(off + i * 8)
-                .store(u64::from_ne_bytes(v), Ordering::Relaxed);
+                .store(u64::from_ne_bytes(*chunk), Ordering::Relaxed);
         }
     }
 
