@@ -5,10 +5,10 @@
 
 use std::alloc::{Layout, alloc_zeroed};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use manta_block_ring::layout::{PAGE, control};
 use manta_block_ring::{
@@ -285,10 +285,13 @@ fn a_peer_writing_garbage_never_panics_the_engine() {
     let (r, base) = region(g);
     let stop = Arc::new(AtomicBool::new(false));
     let s = Arc::clone(&stop);
+    let writes = Arc::new(AtomicU64::new(0));
+    let w = Arc::clone(&writes);
     let len = g.region_len();
     let hostile = thread::spawn(move || {
         let mut x = 0x9e37_79b9_7f4a_7c15u64;
         while !s.load(Ordering::Relaxed) {
+            w.fetch_add(1, Ordering::Relaxed);
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
@@ -309,8 +312,16 @@ fn a_peer_writing_garbage_never_panics_the_engine() {
         volume_blocks: 1 << 20,
         max_blocks: 4,
     };
+    // The scheduler can run the whole loop before the hostile thread starts,
+    // so wait for its first writes, and go on until it has had an effect.
+    while writes.load(Ordering::Relaxed) < 1_000 {
+        thread::yield_now();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
     let (mut ok, mut rejected, mut broken) = (0, 0, 0);
-    for _ in 0..2_000 {
+    let mut passes = 0;
+    while passes < 2_000 || (rejected + broken == 0 && Instant::now() < deadline) {
+        passes += 1;
         let mut sq = r.sq_consumer(0).unwrap();
         let mut q = QueueState::new(0, limits, 0);
         for _ in 0..64 {
