@@ -63,7 +63,9 @@ fn sqe(seq: u64, tag: u16, buf_page: u32, watermark: u64) -> Sqe {
         tag,
         op: 2,
         flags: 0,
-        reserved: [0; 12],
+        byte_off: 0,
+        byte_len: 0,
+        reserved: [0; 6],
     }
 }
 
@@ -223,6 +225,8 @@ fn two_threads_move_every_request_and_completion() {
             buf_pages: depth,
             volume_blocks: 1000,
             max_blocks: 1,
+            sector_bytes: 4096,
+            zeroing: false,
         };
         let mut q = QueueState::new(0, limits, 0);
         let mut done = 0u64;
@@ -336,6 +340,8 @@ fn a_peer_writing_garbage_never_panics_the_engine() {
         buf_pages: depth,
         volume_blocks: 1 << 20,
         max_blocks: 4,
+        sector_bytes: 4096,
+        zeroing: false,
     };
     // The loop can finish before the hostile thread starts, so wait for it.
     while writes.load(Ordering::Relaxed) < 1_000 {

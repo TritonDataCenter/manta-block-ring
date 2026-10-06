@@ -178,12 +178,39 @@ impl Region {
         }
     }
 
+    /// As [`Region::read_buffer`], from byte `at` of queue `q`'s buffer
+    /// area; `at` must be a multiple of 8 too. For the guest range of a
+    /// sub-block request.
+    pub fn read_buffer_at(&self, q: u16, at: usize, out: &mut [u8]) -> bool {
+        match self.byte_range(q, at, out.len()) {
+            Some(off) => {
+                self.load_bulk(off, out);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Same rules as [`Region::read_buffer_at`].
+    pub fn write_buffer_at(&self, q: u16, at: usize, data: &[u8]) -> bool {
+        match self.byte_range(q, at, data.len()) {
+            Some(off) => {
+                self.store_bulk(off, data);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn buffer_range(&self, q: u16, page: u32, len: usize) -> Option<usize> {
+        self.byte_range(q, (page as usize).checked_mul(PAGE)?, len)
+    }
+
+    fn byte_range(&self, q: u16, start: usize, len: usize) -> Option<usize> {
         let g = &self.geometry;
-        if q >= g.queues() || !len.is_multiple_of(8) {
+        if q >= g.queues() || !len.is_multiple_of(8) || !start.is_multiple_of(8) {
             return None;
         }
-        let start = (page as usize).checked_mul(PAGE)?;
         let end = start.checked_add(len)?;
         if end > g.buf_pages() as usize * PAGE {
             return None;

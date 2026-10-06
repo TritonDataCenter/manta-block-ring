@@ -33,7 +33,18 @@ The crate has no dependencies and does no I/O. Each side maps the region, passes
 
 ## Versions
 
-The region header and the control frames carry versions. A side that does not know a version refuses it, and never guesses a layout. Reserved fields are 0 in version 1, and a side that sees a non-zero reserved field refuses the message.
+The region header and the control frames carry versions. A side that does not know a version refuses it, and never guesses a layout. Reserved fields are 0, and a side that sees a non-zero reserved field refuses the message.
+
+Hello and HelloAck always travel in frame version 1, so a peer of any version can read the offer. The engine answers with the highest common version (`control::choose`); both sides then use it for every frame. An Error frame of any known version is still read.
+
+Control protocol version 2 adds:
+
+- Hello feature bits: bit 0 `sector-512e`, bit 2 `deallocate` (bit 1 is reserved for the System V region).
+- AttachOk: the volume's logical sector size (512 or 4096), and the flag `ATTACH_DEALLOCATE`.
+- Submission entry bytes 52 to 57: `byte_off` (u16) and `byte_len` (u32), the guest range inside the request's 4 KiB blocks. Both 0 means whole blocks, as in version 1. A range is allowed only on a 512-byte volume, for write, deallocate and write zeroes. It names whole sectors, starts in the first block, ends in the last, and leaves out at least one sector. Write data sits in the buffer at its place in the blocks, from byte `byte_off` of the first page. A read is always whole blocks.
+- Ops 4 (deallocate) and 5 (write zeroes), with `deallocate` agreed. They carry no buffer and are not bound by `max_blocks`.
+
+A version 1 peer sees none of this: the engine refuses it a 512-byte volume, and takes no op 4 or 5 from it.
 
 ## License
 
