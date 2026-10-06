@@ -40,7 +40,7 @@ impl OpId {
     }
 }
 
-/// Request ops in version 1.
+/// Request ops. 4 and 5 need the `deallocate` feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     /// Read blocks into the buffer.
@@ -49,17 +49,28 @@ pub enum Op {
     Write = 2,
     /// Flush. rust-bhyve completes it itself when writes are durable.
     Flush = 3,
+    /// The range may become a hole; it reads as zeros after.
+    Deallocate = 4,
+    /// The range reads as zeros after.
+    WriteZeroes = 5,
 }
 
 impl Op {
-    /// The op for a wire value, if version 1 has it.
+    /// The op for a wire value, if this build has it.
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             1 => Some(Self::Read),
             2 => Some(Self::Write),
             3 => Some(Self::Flush),
+            4 => Some(Self::Deallocate),
+            5 => Some(Self::WriteZeroes),
             _ => None,
         }
+    }
+
+    /// True for an op that carries no buffer.
+    pub fn is_zeroing(self) -> bool {
+        matches!(self, Self::Deallocate | Self::WriteZeroes)
     }
 }
 
@@ -82,10 +93,16 @@ pub struct Sqe {
     pub tag: u16,
     /// Wire value of the op.
     pub op: u8,
-    /// Zero in version 1.
+    /// Zero.
     pub flags: u8,
-    /// Zero in version 1.
-    pub reserved: [u8; 12],
+    /// Byte in the first block where the guest range starts. Zero in
+    /// protocol version 1.
+    pub byte_off: u16,
+    /// Bytes of the guest range; 0 means every byte of `blocks`. Zero in
+    /// protocol version 1.
+    pub byte_len: u32,
+    /// Zero.
+    pub reserved: [u8; 6],
 }
 
 impl Sqe {
@@ -101,7 +118,9 @@ impl Sqe {
         b[48..50].copy_from_slice(&self.tag.to_le_bytes());
         b[50] = self.op;
         b[51] = self.flags;
-        b[52..64].copy_from_slice(&self.reserved);
+        b[52..54].copy_from_slice(&self.byte_off.to_le_bytes());
+        b[54..58].copy_from_slice(&self.byte_len.to_le_bytes());
+        b[58..64].copy_from_slice(&self.reserved);
         b
     }
 
@@ -109,8 +128,8 @@ impl Sqe {
     pub fn decode(b: &[u8; SQE_BYTES]) -> Self {
         let mut op_id = [0u8; 16];
         op_id.copy_from_slice(&b[0..16]);
-        let mut reserved = [0u8; 12];
-        reserved.copy_from_slice(&b[52..64]);
+        let mut reserved = [0u8; 6];
+        reserved.copy_from_slice(&b[58..64]);
         Self {
             op_id: u128::from_le_bytes(op_id),
             lba: u64_at(b, 16),
@@ -121,6 +140,8 @@ impl Sqe {
             tag: u16::from_le_bytes([b[48], b[49]]),
             op: b[50],
             flags: b[51],
+            byte_off: u16::from_le_bytes([b[52], b[53]]),
+            byte_len: u32_at(b, 54),
             reserved,
         }
     }
@@ -243,7 +264,9 @@ mod tests {
             tag: 3,
             op: 2,
             flags: 0,
-            reserved: [0; 12],
+            byte_off: 512,
+            byte_len: 1536,
+            reserved: [0; 6],
         };
         assert_eq!(Sqe::decode(&e.encode()), e);
     }

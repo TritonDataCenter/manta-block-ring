@@ -36,7 +36,7 @@ pub enum EntryError {
 /// the engine sends Error and detaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reject {
-    /// The op is not read, write or flush.
+    /// The op is unknown, or not agreed for this attachment.
     Op(u8),
     /// Flags or reserved bytes are not zero.
     Reserved,
@@ -72,6 +72,9 @@ pub enum Reject {
     Buffer,
     /// A flush with a block range or a buffer.
     Flush,
+    /// A byte range that breaks the sub-block rules, or one the
+    /// attachment does not allow.
+    Partial,
 }
 
 /// An index moved in a way no correct peer moves it.

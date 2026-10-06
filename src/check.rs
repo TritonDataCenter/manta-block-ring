@@ -2,6 +2,7 @@
 
 use crate::entry::{Cqe, Op, OpId, Sqe};
 use crate::error::{BadCompletion, Reject};
+use crate::layout::PAGE;
 
 /// What the engine agreed for one attachment, in private memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,8 +15,15 @@ pub struct Limits {
     pub buf_pages: u32,
     /// Volume size in 4 KiB blocks.
     pub volume_blocks: u64,
-    /// Most blocks one request may carry.
+    /// Most blocks one read or write may carry.
     pub max_blocks: u32,
+    /// The volume's logical sector: 4096, or 512 once Hello agreed
+    /// `sector-512e`. Below 4096, a write, deallocate or write zeroes may
+    /// name a byte range inside its blocks.
+    pub sector_bytes: u32,
+    /// Ops 4 and 5 are allowed: Hello agreed `deallocate` and the volume
+    /// takes them.
+    pub zeroing: bool,
 }
 
 /// A request that passed every check.
@@ -31,8 +39,29 @@ pub struct Request {
     pub lba: u64,
     /// 4 KiB blocks (0 for flush).
     pub blocks: u32,
-    /// First buffer page (0 for flush).
+    /// First buffer page (0 for flush, deallocate and write zeroes).
     pub buf_page: u32,
+    /// Where the guest range starts in the first block, in bytes.
+    pub byte_off: u16,
+    /// Bytes of the guest range; 0 when it is every byte of `blocks`.
+    pub byte_len: u32,
+}
+
+impl Request {
+    /// True when the guest range does not cover whole blocks.
+    pub fn is_partial(&self) -> bool {
+        self.byte_len != 0
+    }
+
+    /// The guest range as byte offsets inside the request's blocks.
+    pub fn guest_bytes(&self) -> std::ops::Range<usize> {
+        let blocks = self.blocks as usize * PAGE;
+        if self.byte_len == 0 {
+            return 0..blocks;
+        }
+        let from = usize::from(self.byte_off);
+        from..from + self.byte_len as usize
+    }
 }
 
 /// The engine's state for one queue of one attachment.
@@ -79,7 +108,7 @@ impl QueueState {
     /// Call only when [`QueueState::can_take`] is true.
     pub fn check(&mut self, e: &Sqe) -> Result<Request, Reject> {
         let op = Op::from_u8(e.op).ok_or(Reject::Op(e.op))?;
-        if e.flags != 0 || e.reserved != [0; 12] {
+        if e.flags != 0 || e.reserved != [0; 6] {
             return Err(Reject::Reserved);
         }
         if u32::from(e.tag) >= self.limits.depth {
@@ -112,9 +141,12 @@ impl QueueState {
         if e.watermark > id.seq {
             return Err(Reject::Watermark);
         }
+        if e.byte_off != 0 && e.byte_len == 0 {
+            return Err(Reject::Partial);
+        }
         match op {
             Op::Flush => {
-                if e.lba != 0 || e.blocks != 0 || e.buf_page != 0 {
+                if e.lba != 0 || e.blocks != 0 || e.buf_page != 0 || e.byte_len != 0 {
                     return Err(Reject::Flush);
                 }
             }
@@ -122,14 +154,28 @@ impl QueueState {
                 if e.blocks == 0 || e.blocks > self.limits.max_blocks {
                     return Err(Reject::Blocks(e.blocks));
                 }
-                let end = e.lba.checked_add(u64::from(e.blocks));
-                if end.is_none_or(|end| end > self.limits.volume_blocks) {
-                    return Err(Reject::Range);
-                }
+                self.check_range(e)?;
                 let buf_end = u64::from(e.buf_page) + u64::from(e.blocks);
                 if buf_end > u64::from(self.limits.buf_pages) {
                     return Err(Reject::Buffer);
                 }
+                if op == Op::Read && e.byte_len != 0 {
+                    return Err(Reject::Partial);
+                }
+                self.check_partial(e)?;
+            }
+            Op::Deallocate | Op::WriteZeroes => {
+                if !self.limits.zeroing {
+                    return Err(Reject::Op(e.op));
+                }
+                if e.blocks == 0 {
+                    return Err(Reject::Blocks(0));
+                }
+                self.check_range(e)?;
+                if e.buf_page != 0 {
+                    return Err(Reject::Buffer);
+                }
+                self.check_partial(e)?;
             }
         }
         self.set_tag(e.tag, true);
@@ -143,7 +189,39 @@ impl QueueState {
             lba: e.lba,
             blocks: e.blocks,
             buf_page: e.buf_page,
+            byte_off: e.byte_off,
+            byte_len: e.byte_len,
         })
+    }
+
+    fn check_range(&self, e: &Sqe) -> Result<(), Reject> {
+        let end = e.lba.checked_add(u64::from(e.blocks));
+        if end.is_none_or(|end| end > self.limits.volume_blocks) {
+            return Err(Reject::Range);
+        }
+        Ok(())
+    }
+
+    /// A byte range must name whole sectors, start in the first block,
+    /// end in the last, and leave out at least one sector, so each
+    /// request has one encoding and a replay can be matched exactly.
+    fn check_partial(&self, e: &Sqe) -> Result<(), Reject> {
+        if e.byte_len == 0 {
+            return Ok(());
+        }
+        let sector = u64::from(self.limits.sector_bytes);
+        let (off, len) = (u64::from(e.byte_off), u64::from(e.byte_len));
+        let span = u64::from(e.blocks) * PAGE as u64;
+        let end = off + len;
+        let fine = sector != 0
+            && sector < PAGE as u64
+            && off.is_multiple_of(sector)
+            && len.is_multiple_of(sector)
+            && off < PAGE as u64
+            && end <= span
+            && end > span - PAGE as u64
+            && (off != 0 || end != span);
+        if fine { Ok(()) } else { Err(Reject::Partial) }
     }
 
     /// Call once the completion is in the ring. Returns false if nothing
@@ -246,6 +324,8 @@ mod tests {
             buf_pages: 16,
             volume_blocks: 1000,
             max_blocks: 8,
+            sector_bytes: 4096,
+            zeroing: false,
         }
     }
 
@@ -265,7 +345,9 @@ mod tests {
             tag,
             op,
             flags: 0,
-            reserved: [0; 12],
+            byte_off: 0,
+            byte_len: 0,
+            reserved: [0; 6],
         }
     }
 
@@ -286,7 +368,7 @@ mod tests {
         let mut q = QueueState::new(2, limits(), 0);
         assert_eq!(q.check(&sqe(0, 0, 4, 0, 1, 0)), Err(Reject::Op(4)));
         let mut e = sqe(0, 0, 1, 0, 1, 0);
-        e.reserved[11] = 1;
+        e.reserved[5] = 1;
         assert_eq!(q.check(&e), Err(Reject::Reserved));
         assert_eq!(q.check(&sqe(8, 0, 1, 0, 1, 0)), Err(Reject::Tag(8)));
         let mut e = sqe(0, 0, 1, 0, 1, 0);
@@ -316,6 +398,74 @@ mod tests {
         assert_eq!(q.check(&e), Err(Reject::Watermark));
         // Nothing above was taken.
         assert_eq!(q.in_flight(), 0);
+    }
+
+    fn partial(off: u16, len: u32, lba: u64, blocks: u32, op: u8) -> Sqe {
+        let mut e = sqe(0, 0, op, lba, blocks, 0);
+        e.byte_off = off;
+        e.byte_len = len;
+        e
+    }
+
+    #[test]
+    fn a_byte_range_needs_512e_and_whole_sectors_inside_its_blocks() {
+        let mut q = QueueState::new(2, limits(), 0);
+        assert_eq!(q.check(&partial(512, 512, 0, 1, 2)), Err(Reject::Partial));
+        let l = Limits {
+            sector_bytes: 512,
+            ..limits()
+        };
+        let bad = [
+            (512, 0, 1),     // an offset with no length
+            (100, 512, 1),   // not a whole sector
+            (512, 100, 1),   // not a whole sector
+            (0, 4096, 1),    // the whole block: send it with no range
+            (0, 8192, 2),    // the whole blocks
+            (3584, 1024, 1), // past the block
+            (4096, 512, 2),  // starts past the first block
+            (0, 512, 2),     // ends before the last block
+            (512, 4096, 3),  // ends before the last block
+        ];
+        for (off, len, blocks) in bad {
+            let mut q = QueueState::new(2, l, 0);
+            assert_eq!(
+                q.check(&partial(off, len, 0, blocks, 2)),
+                Err(Reject::Partial),
+                "{off} {len} {blocks}"
+            );
+        }
+        for (off, len, blocks) in [(512, 512, 1), (0, 3584, 1), (3584, 1024, 2), (512, 8192, 3)] {
+            let mut q = QueueState::new(2, l, 0);
+            let r = q.check(&partial(off, len, 0, blocks, 2)).unwrap();
+            assert!(r.is_partial());
+            assert_eq!(r.guest_bytes(), off as usize..off as usize + len as usize);
+        }
+        let mut q = QueueState::new(2, l, 0);
+        assert_eq!(q.check(&partial(512, 512, 0, 1, 1)), Err(Reject::Partial));
+        assert_eq!(q.check(&partial(0, 512, 0, 0, 3)), Err(Reject::Flush));
+    }
+
+    #[test]
+    fn zeroing_ops_need_the_feature_and_carry_no_buffer() {
+        let mut q = QueueState::new(2, limits(), 0);
+        assert_eq!(q.check(&sqe(0, 0, 4, 0, 1, 0)), Err(Reject::Op(4)));
+        assert_eq!(q.check(&sqe(0, 0, 5, 0, 1, 0)), Err(Reject::Op(5)));
+        let l = Limits {
+            zeroing: true,
+            ..limits()
+        };
+        let mut q = QueueState::new(2, l, 0);
+        assert_eq!(q.check(&sqe(0, 0, 4, 0, 1, 1)), Err(Reject::Buffer));
+        assert_eq!(q.check(&sqe(0, 0, 4, 0, 0, 0)), Err(Reject::Blocks(0)));
+        assert_eq!(q.check(&sqe(0, 0, 5, 999, 2, 0)), Err(Reject::Range));
+        // No data, so not bound by max_blocks.
+        let r = q.check(&sqe(0, 0, 4, 0, 1000, 0)).unwrap();
+        assert_eq!((r.op, r.blocks), (Op::Deallocate, 1000));
+        let r = q.check(&sqe(1, 1, 5, 7, 1, 0)).unwrap();
+        assert_eq!(r.op, Op::WriteZeroes);
+        // A 4 KiB volume zeroes whole blocks only.
+        let mut q = QueueState::new(2, l, 0);
+        assert_eq!(q.check(&partial(512, 512, 0, 1, 5)), Err(Reject::Partial));
     }
 
     #[test]
