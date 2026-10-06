@@ -392,16 +392,7 @@ impl<const N: usize> Producer<N> {
     /// is full. The entry is not visible until [`Producer::publish`].
     pub fn try_push(&mut self, entry: &[u8; N]) -> Result<bool, Broken> {
         if self.tail.wrapping_sub(self.head) == self.ends.depth {
-            let h = self
-                .ends
-                .region
-                .u32_at(self.ends.peer)
-                .load(Ordering::Acquire);
-            // The consumer's head can only move forward, up to our tail.
-            if h.wrapping_sub(self.head) > self.tail.wrapping_sub(self.head) {
-                return Err(Broken);
-            }
-            self.head = h;
+            self.load_head()?;
             if self.tail.wrapping_sub(self.head) == self.ends.depth {
                 return Ok(false);
             }
@@ -425,6 +416,22 @@ impl<const N: usize> Producer<N> {
     /// Entries pushed and not yet released by the consumer, as last seen.
     pub fn pending(&self) -> u32 {
         self.tail.wrapping_sub(self.head)
+    }
+
+    /// Loads and checks the consumer's head. A head behind the last one
+    /// seen or past our tail is [`Broken`], and the head last seen stays.
+    /// The engine uses it to see which completions rust-bhyve consumed.
+    pub fn load_head(&mut self) -> Result<u32, Broken> {
+        let h = self
+            .ends
+            .region
+            .u32_at(self.ends.peer)
+            .load(Ordering::Acquire);
+        if h.wrapping_sub(self.head) > self.tail.wrapping_sub(self.head) {
+            return Err(Broken);
+        }
+        self.head = h;
+        Ok(h)
     }
 }
 

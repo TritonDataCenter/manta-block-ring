@@ -418,3 +418,42 @@ fn the_consumer_reports_the_tail_it_has_seen() {
     poke(base, PAGE + control::SQ_TAIL, 1);
     assert_eq!(eng.load_tail(), Err(Broken));
 }
+
+#[test]
+fn the_producer_loads_the_head_the_consumer_released() {
+    let g = Geometry::new(1, 4, 1).unwrap();
+    let (r, base) = region(g);
+    let mut cq = r.cq_producer(0).unwrap();
+    let mut vmm = r.cq_consumer(0).unwrap();
+    let c = Cqe {
+        tag: 0,
+        status: Status::Success,
+        op_seq: 0,
+        engine_ns: 0,
+        durable_ns: 0,
+    }
+    .encode();
+    for _ in 0..3 {
+        assert!(cq.try_push(&c).unwrap());
+    }
+    cq.publish();
+    assert_eq!(cq.load_head(), Ok(0));
+    assert!(vmm.pop().unwrap().is_some());
+    assert!(vmm.pop().unwrap().is_some());
+    vmm.release();
+    assert_eq!(cq.load_head(), Ok(2));
+    assert_eq!(cq.pending(), 1);
+
+    // Past the tail, or behind the head last seen: refused, and the head
+    // last seen stays.
+    poke(base, PAGE + control::CQ_HEAD, 4);
+    assert_eq!(cq.load_head(), Err(Broken));
+    poke(base, PAGE + control::CQ_HEAD, 1);
+    assert_eq!(cq.load_head(), Err(Broken));
+    poke(base, PAGE + control::CQ_HEAD, u32::MAX);
+    assert_eq!(cq.load_head(), Err(Broken));
+    assert_eq!(cq.pending(), 1);
+    poke(base, PAGE + control::CQ_HEAD, 3);
+    assert_eq!(cq.load_head(), Ok(3));
+    assert_eq!(cq.pending(), 0);
+}
