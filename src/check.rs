@@ -54,13 +54,12 @@ impl Request {
     }
 
     /// The guest range as byte offsets inside the request's blocks.
-    pub fn guest_bytes(&self) -> std::ops::Range<usize> {
-        let blocks = self.blocks as usize * PAGE;
+    pub fn guest_bytes(&self) -> std::ops::Range<u64> {
         if self.byte_len == 0 {
-            return 0..blocks;
+            return 0..u64::from(self.blocks) * PAGE as u64;
         }
-        let from = usize::from(self.byte_off);
-        from..from + self.byte_len as usize
+        let from = u64::from(self.byte_off);
+        from..from + u64::from(self.byte_len)
     }
 }
 
@@ -168,8 +167,9 @@ impl QueueState {
                 if !self.limits.zeroing {
                     return Err(Reject::Op(e.op));
                 }
-                if e.blocks == 0 {
-                    return Err(Reject::Blocks(0));
+                // A range is merged with data, so it is bound as a write is.
+                if e.blocks == 0 || (e.byte_len != 0 && e.blocks > self.limits.max_blocks) {
+                    return Err(Reject::Blocks(e.blocks));
                 }
                 self.check_range(e)?;
                 if e.buf_page != 0 {
@@ -438,7 +438,10 @@ mod tests {
             let mut q = QueueState::new(2, l, 0);
             let r = q.check(&partial(off, len, 0, blocks, 2)).unwrap();
             assert!(r.is_partial());
-            assert_eq!(r.guest_bytes(), off as usize..off as usize + len as usize);
+            assert_eq!(
+                r.guest_bytes(),
+                u64::from(off)..u64::from(off) + u64::from(len)
+            );
         }
         let mut q = QueueState::new(2, l, 0);
         assert_eq!(q.check(&partial(512, 512, 0, 1, 1)), Err(Reject::Partial));
@@ -463,6 +466,16 @@ mod tests {
         assert_eq!((r.op, r.blocks), (Op::Deallocate, 1000));
         let r = q.check(&sqe(1, 1, 5, 7, 1, 0)).unwrap();
         assert_eq!(r.op, Op::WriteZeroes);
+        let l512 = Limits {
+            sector_bytes: 512,
+            ..l
+        };
+        let mut q = QueueState::new(2, l512, 0);
+        assert_eq!(
+            q.check(&partial(512, 9 * 4096 - 1024, 0, 9, 4)),
+            Err(Reject::Blocks(9))
+        );
+        assert!(q.check(&partial(512, 512, 0, 1, 4)).is_ok());
         // A 4 KiB volume zeroes whole blocks only.
         let mut q = QueueState::new(2, l, 0);
         assert_eq!(q.check(&partial(512, 512, 0, 1, 5)), Err(Reject::Partial));

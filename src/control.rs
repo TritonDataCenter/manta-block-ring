@@ -187,6 +187,10 @@ impl Message {
     /// boundary. Version 1 has no field for AttachOk's sector size or its
     /// version 2 flags.
     pub fn encode_as(&self, id: u32, version: u16) -> Vec<u8> {
+        let version = match self {
+            Self::Hello { .. } | Self::HelloAck { .. } => HELLO_VERSION,
+            _ => version,
+        };
         let mut body = Vec::new();
         match self {
             Self::Hello {
@@ -282,7 +286,9 @@ impl Message {
         let kind = u16::from_le_bytes([buf[4], buf[5]]);
         let found = u16::from_le_bytes([buf[6], buf[7]]);
         let known = (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&found);
-        if found != version && !(kind == ERROR_KIND && known) {
+        let hello = matches!(kind, 1 | 2);
+        let agreed = if hello { HELLO_VERSION } else { version };
+        if !known || (found != agreed && kind != ERROR_KIND) {
             return Err(ControlError::Version(found));
         }
         let version = found;
@@ -553,6 +559,18 @@ mod tests {
         let mut far = err.encode(0);
         far[6] = 3;
         assert_eq!(Message::decode(&far), Err(ControlError::Version(3)));
+        let mut far = Message::Ping.encode_as(1, 2);
+        far[6] = 3;
+        assert_eq!(Message::decode_as(&far, 3), Err(ControlError::Version(3)));
+        // Hello goes in version 1 whatever the session agrees.
+        let hello = Message::Hello {
+            min_version: 1,
+            max_version: 2,
+            features: 5,
+        };
+        let b = hello.encode_as(0, 2);
+        assert_eq!(u16::from_le_bytes([b[6], b[7]]), HELLO_VERSION);
+        assert!(matches!(Message::decode_as(&b, 2), Ok(Some(_))));
     }
 
     #[test]

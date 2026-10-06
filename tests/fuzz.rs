@@ -101,11 +101,12 @@ proptest! {
             }
             prop_assert!(r.op != Op::Read || r.byte_len == 0);
             let g = r.guest_bytes();
-            let span = r.blocks as usize * PAGE;
+            let span = u64::from(r.blocks) * PAGE as u64;
             prop_assert!(g.end <= span || r.op == Op::Flush);
             if r.is_partial() {
-                prop_assert!(g.start < PAGE && g.end > span - PAGE && g.len() < span);
+                prop_assert!(g.start < PAGE as u64 && g.end > span - PAGE as u64 && g.end - g.start < span);
                 prop_assert!(g.start % 512 == 0 && g.end % 512 == 0 && !g.is_empty());
+                prop_assert!(r.blocks <= l.max_blocks);
             }
         }
     }
